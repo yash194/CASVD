@@ -1,0 +1,485 @@
+Critical Analysis — Component 4: Per-Agent Adaptive Alpha
+                                                                    
+  This component is the integration hub connecting C2 (inverted temperature) and C3 (invalid coordination signal). Most of its pathologies are inherited, but there are several new, independent failures in the  
+  logic of the mapping itself.                                                                                                                                                                                    
+                                                                                                                                                                                                                  
+  ---                                                                                                                                                                                                             
+  Problem 1 (CATASTROPHIC): alpha_factor = 0 for "Well-Coordinated" Agents Triggers Float32 NaN in Combat                                                                                                         
+                                                                                                                                                                                                                  
+  When coord_signal_i ≈ 0:
+                                                                                                                                                                                                                  
+  alpha_factor_i = 0.0 * coord_signal_i = 0.0
+  alpha_per_i    = 0.0 * DeltaQ_i       = 0.0                                                                                                                                                                     
+  alpha_eff_i    = max(0.0, 0.005)      = 0.005                                                                                                                                                                   
+  
+  In combat with an enemy in range (established in C2 analysis), DeltaQ ≈ 1.5–2.0. Then:                                                                                                                          
+                  
+  logit = Q / alpha_eff = Q / 0.005                                                                                                                                                                               
+                                                                                                                                                                                                                  
+  With Q ∈ [-2, +2] (tanh from C1):
+                                                                                                                                                                                                                  
+  max logit = 2.0 / 0.005 = 400
+  exp(400) → +∞ in float32   (overflow threshold: exp(88.7))                                                                                                                                                      
+                                                                                                                                                                                                                  
+  Well-coordinated agents produce NaN targets in combat. The mixing network receives NaN values for V_soft_i when coord_signal_i is near zero and DeltaQ is large — exactly the agents that are supposedly        
+  performing best. The TD loss is NaN. Gradient updates for that batch are undefined.                                                                                                                             
+                                                                                                                                                                                                                  
+  This is not a corner case. In well-trained mid-late game:                                                                                                                                                       
+  - Coordination improves → coord_signal → 0 for some agents (best case for C3)
+  - Enemies are in range → DeltaQ ≈ 1.5–2.0 (normal combat state)                                                                                                                                                 
+  - Both conditions co-occur → NaN                               
+                                                                                                                                                                                                                  
+  The behavioral table uses DeltaQ = 0.04 to hide this. In real SMACv2, DeltaQ = 0.04 represents an agent that has essentially learned NOTHING (all Q-values within 0.04 of each other). Realistic trained combat
+  DeltaQ is 10–50× larger.                                                                                                                                                                                        
+                  
+  The most favorable scenario the algorithm can achieve triggers NaN.                                                                                                                                             
+                  
+  ---                                                                                                                                                                                                             
+  Problem 2 (CRITICAL): The Adaptive Mapping Is Actually Static Throughout Training
+                                                                                                                                                                                                                  
+  The full temporal structure of coord_signal:
+                                                                                                                                                                                                                  
+  Initialization:    coord_signal_i ≈ 1.0 for all i   (InfoNCE ≈ log(16), random encoder)
+  EMA tau = 0.999:  responds with time constant = 1000 gradient updates                                                                                                                                           
+  Training window:  2M env steps ≈ 312 gradient batches (at 32 eps/batch, T=200)                                                                                                                                  
+                                                                                                                                                                                                                  
+  After full training run (312 batches):                                                                                                                                                                          
+      coord_signal drift = 1 - 0.999^312 = 1 - 0.73 = 0.27 of full range at most                                                                                                                                  
+                                                                                                                                                                                                                  
+  Throughout almost all of training, coord_signal_i ≈ 1.0 for all agents. Therefore:                                                                                                                              
+                                                                                                                                                                                                                  
+  alpha_factor_i ≈ 1.0   for all i, all of training                                                                                                                                                               
+                                                                                                                                                                                                                  
+  The "per-agent adaptive temperature" reduces to a single fixed value (1.0) shared by all agents for the vast majority of the training run. The differentiation — the entire stated point of the component —     
+  never manifests in the actual training window.                                                                                                                                                                  
+                                                                                                                                                                                                                  
+  What does manifest is: alpha_eff_i = max(1.0 × DeltaQ_i, 0.005) for all agents, all timesteps. This is identically the broken DeltaQ-proportional temperature from Component 2, with no per-agent adaptation at 
+  all. The complexity of the InfoNCE sensor, EMA smoothing, and linear mapping adds zero value over the scalar case alpha_factor = 1.0 (constant).
+                                                                                                                                                                                                                  
+  ---             
+  Problem 3 (CRITICAL): Heterogeneous Targets Break the Mixing Network's Learning Assumptions
+                                                                                                                                                                                                                  
+  At any training timestep, different agents have different coord_signal_i (even if slightly), producing:
+                                                                                                                                                                                                                  
+  Agent 1 (coord = 0.1): V_soft_1 ≈ max_a Q_target_1   (near hard-max, low pessimism)
+  Agent 2 (coord = 0.9): V_soft_2 ≈ mean_a Q_target_2  (near uniform average, high pessimism)                                                                                                                     
+                                                                                                                                                                                                                  
+  Q_total_target = NMixer([V_soft_1, V_soft_2, ...], state)                                                                                                                                                       
+                                                                                                                                                                                                                  
+  The mixing network must simultaneously satisfy:                                                                                                                                                                 
+  
+  monotonicity:  ∂Q_total / ∂V_soft_i > 0   for all i                                                                                                                                                             
+  consistency:   Q_total_target ≈ true joint return                                                                                                                                                               
+                                                                                                                                                                                                                  
+  But the true joint return has a well-defined structure — it's the discounted future reward under the joint optimal policy. V_soft_1 is a reasonable approximation of this (near hard-max). V_soft_2 is NOT —    
+  it's pessimistically averaged. The mixing network is receiving inputs where:                                                                                                                                    
+                                                                                                                                                                                                                  
+  V_soft_1 ≈ R_true_1   (accurate)
+  V_soft_2 << R_true_2  (systematically low by α_2 * H(π_2))                                                                                                                                                      
+                                                                                                                                                                                                                  
+  The NMixer's weight for agent 2, w_2, must compensate for V_soft_2 being too low. But w_2 must remain non-negative (monotonicity constraint). The only way to compensate for a persistently-low V_soft_2 is to  
+  increase the mixing network's bias term or increase w_2. But increasing w_2 distorts the relative weights between agents, breaking the relative contribution calibration.                                       
+                                                                                                                                                                                                                  
+  The mixer is simultaneously fitting two inconsistent estimation schemes, receiving corrupted signal from poorly-coordinated agents while trying to use accurate signal from well-coordinated agents. The        
+  effective loss surface has two conflicting attractors.
+                                                                                                                                                                                                                  
+  ---             
+  Problem 4 (CRITICAL): The "Diverse Q-Values Help the Mixer Learn" Claim Is Backwards
+                                                                                                                                                                                                                  
+  The stated rationale:
+  ▎ "gives softer targets... provides the mixer with more diverse Q-values to learn from, and prevents premature convergence to a suboptimal joint policy"                                                        
+                                                                                                                                                                                                                  
+  This reasoning inverts the QMIX learning dynamic. The mixer's task is:
+                                                                                                                                                                                                                  
+  minimize E[(Q_total_online - Q_total_target)^2]
+                                                                                                                                                                                                                  
+  subject to ∂Q_total/∂Q_i ≥ 0. The mixer does NOT benefit from diverse targets — it benefits from accurate targets. Target diversity:                                                                            
+                                                                                                                                                                                                                  
+  Var(Q_total_target) increases with Var(V_soft across agents)                                                                                                                                                    
+                                                                                                                                                                                                                  
+  Higher target variance → higher gradient variance → slower convergence of mixing weights. The mixer already struggles with the non-stationarity of individual Q-values updating simultaneously (fundamental MARL
+   challenge). Adding artificial variance in the targets from heterogeneous alpha makes the mixing problem strictly harder.                                                                                       
+                                                                                                                                                                                                                  
+  The correct way to prevent premature convergence in QMIX is through action-space exploration (ε-greedy), not target pessimism. These are orthogonal axes:                                                       
+  
+  Exploration:  affects WHICH states are visited (data collection)                                                                                                                                                
+  Target soft:  affects WHAT VALUE is assigned to visited states (training signal)
+                                                                                                                                                                                                                  
+  Soft targets don't diversify the data — they corrupt the labels on already-collected data.                                                                                                                      
+                                                                                                                                                                                                                  
+  ---                                                                                                                                                                                                             
+  Problem 5 (CRITICAL): The Direction of Adaptation Is Anti-Learning for Poorly-Coordinated Agents
+                                                                                                                                                                                                                  
+  The mechanism for an agent with coord_signal ≈ 1.0:
+                                                                                                                                                                                                                  
+  alpha_eff ≈ DeltaQ (large, since alpha_factor ≈ 1)
+  pi_soft ≈ uniform distribution over actions                                                                                                                                                                     
+  V_soft = E_{uniform}[Q_target] ≈ mean_a Q_target                                                                                                                                                                
+                                                                                                                                                                                                                  
+  The TD target teaches this agent: "all your actions are worth approximately the mean Q-value." This gives a Q-learning gradient:                                                                                
+                  
+  ∂L/∂Q_i(a) ∝ (Q_online(a) - V_soft) ≈ (Q_online(a) - mean_a Q_online(a))                                                                                                                                        
+                                                                                                                                                                                                                  
+  This gradient pushes all Q-values toward their mean — it erases action differentiation. The agent's Q-values converge to uniform, DeltaQ → 0, alpha → floor, briefly gets near-hard-argmax targets... but then  
+  its InfoNCE loss is still high (coord_signal still ≈ 1.0, EMA frozen), so alpha_factor stays high, and next time DeltaQ grows, the soft target kicks back in.                                                   
+                                                                                                                                                                                                                  
+  The oscillation cycle:                                                                                                                                                                                          
+  DeltaQ grows (agent learns)
+    → alpha_eff grows (inverted temperature from C2)                                                                                                                                                              
+    → pi_soft flattens                                                                                                                                                                                            
+    → V_soft ≈ mean Q 
+    → TD gradient erases Q differentiation                                                                                                                                                                        
+    → DeltaQ shrinks                      
+    → alpha → floor                                                                                                                                                                                               
+    → near-hard targets briefly
+    → Q values start differentiating again                                                                                                                                                                        
+    → DeltaQ grows → cycle repeats                                                                                                                                                                                
+                                  
+  Poorly-coordinated agents are trapped in a limit cycle. They can never converge because the mechanism activates whenever Q-values begin to discriminate. This is a learning attractor at uniform Q-values —     
+  which corresponds to a uniformly random policy, the worst possible outcome for MARL.                                                                                                                            
+  
+  ---                                                                                                                                                                                                             
+  Problem 6 (SIGNIFICANT): The Behavioral Table Is Constructed With an Unrealistic DeltaQ
+                                                                                                                                                                                                                  
+  The table uses DeltaQ = 0.04 for all cases. Let's reconstruct it with realistic combat DeltaQ values (from the actual SMACv2 Q-value analysis in C2):
+                                                                                                                                                                                                                  
+  DeltaQ = 1.5 (enemy in range, learned policy, realistic combat):                                                                                                                                                
+                                                                                                                                                                                                                  
+  ┌───────────────────┬──────────────┬───────────┬─────────────────────────────────────────────┐                                                                                                                  
+  │   coord_signal    │ alpha_factor │ alpha_eff │         Softmax behavior (Q∈[-2,2])         │
+  ├───────────────────┼──────────────┼───────────┼─────────────────────────────────────────────┤                                                                                                                  
+  │ ~0.0 (well-coord) │ ~0.0         │ 0.005     │ exp(±400) → NaN                             │
+  ├───────────────────┼──────────────┼───────────┼─────────────────────────────────────────────┤
+  │ ~0.3              │ ~0.3         │ 0.45      │ logits ∈ [-4.4, +4.4] → moderately peaked   │                                                                                                                  
+  ├───────────────────┼──────────────┼───────────┼─────────────────────────────────────────────┤                                                                                                                  
+  │ ~0.8              │ ~0.8         │ 1.20      │ logits ∈ [-1.7, +1.7] → nearly uniform      │                                                                                                                  
+  ├───────────────────┼──────────────┼───────────┼─────────────────────────────────────────────┤                                                                                                                  
+  │ ~1.0 (poor-coord) │ ~1.0         │ 1.50      │ logits ∈ [-1.3, +1.3] → essentially uniform │
+  └───────────────────┴──────────────┴───────────┴─────────────────────────────────────────────┘                                                                                                                  
+                  
+  The behavioral table's "near hard-max" for well-coordinated agents is actually NaN. The "very soft" for poorly-coordinated agents is actually near-uniform random policy. The true behaviors are far more       
+  extreme and damaging than the table suggests.
+                                                                                                                                                                                                                  
+  DeltaQ = 0.005 (untrained network, early training):                                                                                                                                                             
+  
+  ┌──────────────┬────────────────────────────────────────┬────────────────────────────────────────────────┐                                                                                                      
+  │ coord_signal │ alpha_eff = max(factor × 0.005, 0.005) │               Effective behavior               │
+  ├──────────────┼────────────────────────────────────────┼────────────────────────────────────────────────┤                                                                                                      
+  │ Any value    │ 0.005 (floor dominates)                │ All agents get hard-argmax regardless of coord │
+  └──────────────┴────────────────────────────────────────┴────────────────────────────────────────────────┘
+                                                                                                                                                                                                                  
+  Early training: the floor dominates entirely. All agents behave identically (alpha = 0.005), making the "per-agent" claim vacuous.                                                                              
+                                                                                                                                                                                                                  
+  The component has two operating regimes:                                                                                                                                                                        
+  1. Early training: floor dominates, all agents identical, per-agent adaptation irrelevant
+  2. Late training: alpha ≈ DeltaQ, well-coordinated agents NaN, poorly-coordinated agents random                                                                                                                 
+                  
+  Neither regime supports the intended behavior.                                                                                                                                                                  
+                  
+  ---                                                                                                                                                                                                             
+  Problem 7 (SIGNIFICANT): The Asymmetric Gradient Quality Creates Systemic Bias in Monotone Weights
+                                                                                                                                                                                                                  
+  Let w_i ≥ 0 be the mixing weight for agent i (simplified QMIX). The mixing loss:
+                                                                                                                                                                                                                  
+  L = (Σ_i w_i * Q_i_online - Σ_i w_i * V_soft_i)^2
+                                                                                                                                                                                                                  
+  Gradient with respect to w_i:                                                                                                                                                                                   
+                                                                                                                                                                                                                  
+  ∂L/∂w_i = 2 * (Q_total_online - Q_total_target) * (Q_i_online - V_soft_i)                                                                                                                                       
+                                                                                                                                                                                                                  
+  For well-coordinated agents: V_soft_i ≈ max Q_i_target → Q_i_online - V_soft_i reflects a meaningful TD error.                                                                                                  
+                                                                                                                                                                                                                  
+  For poorly-coordinated agents: `V_soft                                                                                                                                                                          
+                  
+⏺ Critical Analysis — Component 4: Per-Agent Adaptive Alpha         
+                                                                    
+  ---
+  Problem 1 (CATASTROPHIC): CASVD Targets ≤ QMIX Targets Always — The Mechanism Has No Upside                                                                                                                     
+                                                                                                                                                                                                                  
+  This is a mathematical certainty, not an empirical observation. Since V_soft_i = E_{π_soft}[Q_target_i] and softmax is a distribution over actions:                                                             
+                                                                                                                                                                                                                  
+  V_soft_i = Σ_a π_soft(a|s,i) * Q_target(s,i,a)
+           ≤ max_a Q_target(s,i,a) = V_QMIX_i                                                                                                                                                                     
+                                                                                                                                                                                                                  
+  with equality iff π_soft is a delta on the argmax iff alpha_eff → 0                                                                                                                                             
+                                                                                                                                                                                                                  
+  The per-agent alpha modulates HOW MUCH below QMIX each agent's target is:                                                                                                                                       
+                  
+  Well-coordinated  → alpha_eff → 0.005 → V_soft ≈ V_QMIX   (QMIX behavior)                                                                                                                                       
+  Poorly-coordinated → alpha_eff > 0   → V_soft < V_QMIX    (pessimistic bias)                                                                                                                                    
+                                                                                                                                                                                                                  
+  At every timestep, for every agent, for every state: V_soft ≤ V_QMIX. Therefore Q_total_target_CASVD ≤ Q_total_target_QMIX always (since NMixer has non-negative weights).                                      
+                                                                                                                                                                                                                  
+  The algorithm can only produce equal or worse TD targets than QMIX. There is no state, timestep, or coordination configuration where CASVD's targets are strictly better. This is a formal bound, not a         
+  heuristic concern. An algorithm that strictly underestimates all targets relative to QMIX cannot surpass QMIX in expectation — it will learn systematically lower Q-values and therefore a more conservative,
+  less aggressive policy. In SMACv2 where winning requires aggressive forward pressure, conservative Q-values directly reduce battle win rates.                                                                   
+                  
+  ---
+  Problem 2 (CATASTROPHIC): Well-Coordinated Agents Always Hit alpha_floor = 0.005 → Float32 NaN
+                                                                                                                                                                                                                  
+  From the linear mapping:
+  alpha_factor_i = 0.0 + 1.0 * coord_signal_i = coord_signal_i                                                                                                                                                    
+  alpha_per_i = coord_signal_i * DeltaQ_i                     
+                                         
+  For a well-coordinated agent with coord_signal_i → 0:                                                                                                                                                           
+                                                                                                                                                                                                                  
+  alpha_per_i → 0 * DeltaQ = 0                                                                                                                                                                                    
+  alpha_eff_i = max(0, 0.005) = 0.005   ← floor always active                                                                                                                                                     
+                                                                                                                                                                                                                  
+  The softmax computation:                                                                                                                                                                                        
+                                                                                                                                                                                                                  
+  logit(a) = Q_online(s,i,a) / 0.005 = Q_online * 200                                                                                                                                                             
+                                                                                                                                                                                                                  
+  With Q bounded in [-2, +2] by Component 1's tanh:                                                                                                                                                               
+                                                                                                                                                                                                                  
+  max logit = 2.0 / 0.005 = 400                                                                                                                                                                                   
+  exp(400) → float32 overflow at exp(88.7) → inf or NaN                                                                                                                                                           
+                                                                                                                                                                                                                  
+  This is not an edge case — it's the normal operating regime of every "well-coordinated" agent every training step. The softmax denominator is Σ_a exp(Q_a / 0.005), which includes at least one exp(≥ 88) term  
+  whenever any Q-value exceeds ±0.44. With Q-values initialized from orthogonal weights and growing quickly, this threshold is crossed within the first few hundred gradient steps.                               
+                                                                                                                                                                                                                  
+  The NaN propagates:
+
+  π_soft = NaN → V_soft = NaN → Q_total_target = NaN → TD_loss = NaN → all gradients = NaN
+  → training collapses                                                                                                                                                                                            
+  
+  If PyTorch's softmax implementation uses the log-sum-exp trick (subtract max before exponentiation), it may avoid overflow — but then logit(max_action) - logit(max_action) = 0 and all other logits are (Q_a - 
+  Q_max) / 0.005. For the next-best action with Q difference of 0.1: (−0.1) / 0.005 = −20. exp(−20) ≈ 2e−9. Pi_soft degenerates to a near-perfect one-hot on the argmax.
+                                                                                                                                                                                                                  
+  Well-coordinated agents produce the SAME policy as hard argmax — but with numerically degenerate gradients. The V_soft for well-coordinated agents is then exactly max Q_target, giving pure QMIX behavior. This
+   means for any agent that happens to be "well-coordinated" (including all agents under the encoder collapse identified in Component 3), the entire CASVD machinery collapses to standard QMIX targets with
+  numerical instability overhead.                                                                                                                                                                                 
+                  
+  ---
+  Problem 3 (CRITICAL): alpha_factor_i = coord_signal_i Is the Identity — Component 4 Adds No Transformation
+                                                                                                                                                                                                                  
+  alpha_min = 0.0,  alpha_max = 1.0
+  alpha_factor_i = 0.0 + (1.0 - 0.0) * coord_signal_i = coord_signal_i                                                                                                                                            
+                                                                                                                                                                                                                  
+  This is the identity mapping. Component 4 passes coord_signal through unchanged and renames it alpha_factor. The entire "per-agent adaptive alpha" component reduces to:                                        
+                                                                                                                                                                                                                  
+  alpha_eff_i = max(coord_signal_i * DeltaQ_i, 0.005)                                                                                                                                                             
+                                                                                                                                                                                                                  
+  This is a one-line equation. There is no learnable parameter, no nonlinearity, no domain adaptation. The entire component's complexity is three scalar multiplications and a max operation. Calling this a      
+  "component" of the algorithm obscures that the actual design work lives entirely in C2 (DeltaQ) and C3 (coord_signal).                                                                                          
+                                                                                                                                                                                                                  
+  The design choices that matter — alpha_min=0, alpha_max=1 — are arbitrary constants with no principled grounding relative to SMACv2's Q-value scale. As shown above, alpha_min=0 is numerically catastrophic.   
+  alpha_max=1 gives max alpha_eff = max(coord_signal * DeltaQ, 0.005). With coord_signal_max=1 and DeltaQ_max=4 (tanh bounds): max alpha_eff = 4.0. Whether this is "exploration-level softness" depends entirely
+  on the Q-value scale — an unmotivated choice.                                                                                                                                                                   
+                  
+  The needed principled choice for alpha_min/max:                                                                                                                                                                 
+  
+  Given Q ∈ [-2, 2] (from tanh) and requiring float32 safe softmax (max logit < 88):                                                                                                                              
+  alpha_min_safe = Q_range / 88 = 4 / 88 ≈ 0.045   (not 0.005)
+                                                                                                                                                                                                                  
+  With a linear Q-head (if tanh is removed, fixing C1): Q-values could reach ~30 in late training. Then:                                                                                                          
+  alpha_min_safe = 30 / 88 ≈ 0.34   (not 0.005, not 0.045)                                                                                                                                                        
+                                                                                                                                                                                                                  
+  The alpha_min must be calibrated to the Q-value range, which itself changes throughout training. A fixed constant is wrong by construction.                                                                     
+                                                                                                                                                                                                                  
+  ---                                                                                                                                                                                                             
+  Problem 4 (CRITICAL): Per-Agent Temperature Injects Artificial Non-Stationarity into the Mixer                                                                                                                  
+                                                                                                                                                                                                                  
+  In QMIX, the mixing network NMixer(V_1, ..., V_n, state) is trained to represent a monotonic function where all V_i have comparable scales because they all use the same V_hard computation. The mixing
+  network's learned weights implicitly assume homogeneity in how V_i values are computed.                                                                                                                         
+                  
+  With per-agent alpha:                                                                                                                                                                                           
+                  
+  V_soft_i = E_{π_soft(; alpha_eff_i)}[Q_target_i]                                                                                                                                                                
+                                                                                                                                                                                                                  
+  Different agents have different alpha_eff_i, causing different suppression levels. The mixer receives:                                                                                                          
+                                                                                                                                                                                                                  
+  Input: [V_soft_A, V_soft_B, ..., V_soft_N]                                                                                                                                                                      
+  where V_soft_A uses alpha_eff=0.005 (QMIX-like)
+  and   V_soft_B uses alpha_eff=1.5  (strongly suppressed)                                                                                                                                                        
+                                                                                                                                                                                                                  
+  These are not comparable values — they're computed under different pessimism levels. The mixer's monotonic weights try to combine apples (V_QMIX-like) with oranges (V_soft-pessimistic). The mixing network    
+  must simultaneously:                                                                                                                                                                                            
+                                                                                                                                                                                                                  
+  - Learn that V_soft_A ≈ 8.0 correctly represents agent A's contribution                                                                                                                                         
+  - Learn that V_soft_B ≈ 1.2 is artificially suppressed and should be up-weighted to compensate
+                                                                                                                                                                                                                  
+  But QMIX's non-negative weight constraint was designed for monotonicity over the TRUE value ordering — it breaks down when some inputs are artificially deflated relative to others. The optimal mixing weights 
+  for [V_QMIX_A, V_QMIX_B] differ from those for [V_QMIX_A, V_soft_B]. As coord_signals evolve over training (even slowly), the optimal mixing weights change, creating non-stationarity in the mixer's loss      
+  landscape.                                                                                                                                                                                                      
+                  
+  Quantify the scale difference at a concrete point in training:                                                                                                                                                  
+  
+  Say Q_target values are in [0, 10] (reasonable for mid-training without tanh):                                                                                                                                  
+  - Agent A (coord_signal=0.05): V_soft_A ≈ V_hard ≈ 10.0
+  - Agent B (coord_signal=0.8): alpha_eff = 0.8 * DeltaQ = 0.8 * 3.0 = 2.4, V_soft_B = E[Q_target under α=2.4]                                                                                                    
+                                                                                                              
+  With pi_soft at alpha=2.4 over Q ∈ [0, 10], Q_max=10, Q_mean=3:                                                                                                                                                 
+  pi_soft(argmax) = exp(10/2.4) / (exp(10/2.4) + Σ other)                                                                                                                                                         
+                 ≈ exp(4.17) / (exp(4.17) + 10*exp(1.25))                                                                                                                                                         
+                 ≈ 64.7 / (64.7 + 34.9) ≈ 0.65                                                                                                                                                                    
+  V_soft_B ≈ 0.65*10 + 0.35*3 ≈ 7.55          
+                                                                                                                                                                                                                  
+  The mixer sees [10.0, 7.55] rather than QMIX's [10.0, 10.0]. The agent B's contribution is understated by 24.5% solely due to the coordination penalty. The mixer's weights compensate for this by upweighting  
+  agent B — but this upweighting is dynamic (coord_signal_B changes over time), creating a moving target for the mixer's weight optimization.                                                                     
+                                                                                                                                                                                                                  
+  ---                                                                                                                                                                                                             
+  Problem 5 (CRITICAL): The Strategy Correctly Labeled "Poorly Coordinated" by C3 Is Often Optimal in SMACv2
+                                                                                                                                                                                                                  
+  From Component 3's analysis: flanking agents (isolated, diverse observations) get high InfoNCE loss → high coord_signal → high alpha_eff → pessimistic V_soft → mixing network underweights their contribution.
+                                                                                                                                                                                                                  
+  This is the wrong direction for SMACv2's optimal strategies. Known high-win-rate strategies in SMACv2:                                                                                                          
+                                                                                                                                                                                                                  
+  ┌────────────────────────┬──────────────────────────────────┬────────────────────────────────────┬─────────────────────────┬───────────────────────────────────┐                                                
+  │        Strategy        │       Agent configuration        │         coord_signal (C3)          │     CASVD response      │           Actual value            │
+  ├────────────────────────┼──────────────────────────────────┼────────────────────────────────────┼─────────────────────────┼───────────────────────────────────┤                                                
+  │ Focus fire (clustered) │ All agents on same target        │ Low (similar obs)                  │ Low alpha, near-QMIX    │ Often suboptimal (ignores kiting) │
+  ├────────────────────────┼──────────────────────────────────┼────────────────────────────────────┼─────────────────────────┼───────────────────────────────────┤
+  │ Kite + flank           │ Agents spread, different enemies │ High (diverse obs)                 │ High alpha, pessimistic │ Often optimal                     │                                                
+  ├────────────────────────┼──────────────────────────────────┼────────────────────────────────────┼─────────────────────────┼───────────────────────────────────┤                                                
+  │ Surround               │ Agents encircle enemies          │ High (diverse obs from all angles) │ High alpha, pessimistic │ Often optimal                     │                                                
+  └────────────────────────┴──────────────────────────────────┴────────────────────────────────────┴─────────────────────────┴───────────────────────────────────┘                                                
+                  
+  CASVD's per-agent alpha penalizes exactly the spatial diversity that enables surrounding and flanking — which are consistently the highest win-rate strategies in protoss and terran scenarios. The algorithm   
+  learns to systematically devalue the actions of flanking agents through pessimistic V_soft, driving them toward the cluster (where coord_signal is lower) and abandoning the optimal configuration.
+                                                                                                                                                                                                                  
+  ---             
+  Problem 6 (CRITICAL): The "Exploration" Rationale Is Mechanistically Incorrect
+                                                                                                                                                                                                                  
+  Stated:
+  ▎ "Poorly-coordinated agents get softer targets... more diverse Q-values to learn from, prevents premature convergence"                                                                                         
+                                                                                                                         
+  What soft targets actually do vs. what this claims:
+                                                                                                                                                                                                                  
+  ┌───────────────────────────────┬───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+  │             Claim             │                                                                                  Reality                                                                                  │   
+  ├───────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤   
+  │ "More diverse Q-values"       │ Lower V_soft → smaller                                                                                                                                                    │
+  ├───────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤   
+  │ "Prevents premature           │ Reduces V_soft below true value → biases toward underestimation → not convergence prevention                                                                              │   
+  │ convergence"                  │                                                                                                                                                                           │   
+  ├───────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤   
+  │ "More exploratory"            │ Exploration = action diversity during rollout. Soft targets affect VALUE estimates, not action selection. The rollout actions are chosen by ε-greedy on Q_online,         │   
+  │                               │ unchanged by soft targets                                                                                                                                                 │
+  └───────────────────────────────┴───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘   
+                  
+  If the goal is exploration for poorly-coordinated agents, the correct mechanism is: increase ε in ε-greedy rollout for those agents, or add an entropy bonus to the TD loss for those agents, or use intrinsic  
+  motivation. Softening the VALUE TARGET is orthogonal to exploration — it's regularization of the value function, not behavioral diversification.
+                                                                                                                                                                                                                  
+  The actual mechanism: Soft targets for agent i → Q_total_target is lower → agents across the team learn that their actions are worth less than they actually are → QMIX mixes toward more conservative (lower-Q)
+   actions → fewer attacks → lower win rate. This is pessimistic regularization uniformly applied to the "poorly coordinated" agents, which — by C3's broken definition — includes any agent executing an optimal
+  flanking strategy.                                                                                                                                                                                              
+                  
+  ---
+  Problem 7 (SIGNIFICANT): The Table's DeltaQ = 0.04 Makes All Agents Numerically Catastrophic
+                                                                                                                                                                                                                  
+  The behavioral interpretation table:
+                                                                                                                                                                                                                  
+  All rows: DeltaQ (example) = 0.04
+                                                                                                                                                                                                                  
+  With alpha_floor = 0.005:                                                                                                                                                                                       
+  Moderately coordinated: alpha_eff = max(0.3 * 0.04, 0.005) = max(0.012, 0.005) = 0.012
+  → logit = Q / 0.012 = 2.0 / 0.012 = 167                                                                                                                                                                         
+  → exp(167) → NaN in float32 (overflow at exp(88.7))                                                                                                                                                             
+                                                                                                                                                                                                                  
+  Every row in the table except "Completely uncoordinated" (alpha_eff = 0.040, logit = 50 — borderline) produces float32 overflow. The table constructed to illustrate the mechanism actually illustrates         
+  numerical catastrophe at every coordination level. This suggests the example values were chosen to show intuitive variation in alpha_eff without verifying float32 compatibility.                               
+                                                                                                                                                                                                                  
+  The only numerically safe regime (given tanh Q ∈ [-2, 2]):                                                                                                                                                      
+                  
+  alpha_eff > Q_range / 80 = 4 / 80 = 0.05   for all agents                                                                                                                                                       
+                                                                                                                                                                                                                  
+  This requires either:                                                                                                                                                                                           
+  - alpha_floor > 0.05 (10× larger than current 0.005)                                                                                                                                                            
+  - OR coord_signal * DeltaQ > 0.05 always — meaning no agent is ever "well-coordinated" in the current sense                                                                                                     
+                                                                                                             
+  Either condition defeats the stated purpose: if alpha_floor is large enough for numerical safety, the "hard-max for well-coordinated agents" behavior vanishes. If alpha_min > 0.05, well-coordinated agents    
+  still have soft (not hard-max) targets, defeating the exploitation benefit.                                                                                                                                     
+                                                                                                                                                                                                                  
+  ---                                                                                                                                                                                                             
+  Problem 8 (SIGNIFICANT): alpha_max = 1.0 Is Poorly Calibrated to SMACv2's Action Space Size
+                                                                                                                                                                                                                  
+  The softmax "softness" under alpha = 1.0 depends on the Q-value range AND the number of available actions:
+                                                                                                                                                                                                                  
+  For SMACv2 5v5 with n_enemies=5, n_avail ≈ 11 (stop + 4 move + 5 attack) and Q ∈ [-2, 2]:                                                                                                                       
+                                                                                                                                                                                                                  
+  pi_soft(best action) with alpha=1.0 and Q_best=2.0, others ≈ 0:                                                                                                                                                 
+  = exp(2) / (exp(2) + 10*exp(0))                                                                                                                                                                                 
+  = 7.39 / (7.39 + 10) = 7.39/17.39 = 0.425
+                                                                                                                                                                                                                  
+  The "completely uncoordinated" agent gives 42.5% probability to the best action. This is barely softer than a 2× bias. The policy is not "very soft (maximum exploration)" as described — it's still a          
+  relatively concentrated distribution.                                                                                                                                                                           
+                                                                                                                                                                                                                  
+  For SMACv2 10v10 with n_avail ≈ 15 (stop + 4 move + 10 attack) and Q ∈ [-2, 2]:                                                                                                                                 
+  
+  pi_soft(best action) with alpha=1.0:                                                                                                                                                                            
+  = exp(2) / (exp(2) + 14*exp(0))
+  = 7.39 / (7.39 + 14) = 7.39/21.39 = 0.346
+                                                                                                                                                                                                                  
+  Still 34.6% on the best action. The maximum "exploration" level provides only a 3× bias toward the best action — far from uniform. Calling this "very soft (maximum exploration)" is qualitatively wrong.       
+                                                                                                                                                                                                                  
+  For the table to represent meaningful softness levels, alpha_max needs to be calibrated as:                                                                                                                     
+                  
+  alpha_max_for_near_uniform = Q_range / log(n_avail) = 4 / log(15) ≈ 1.48   (for 10v10)                                                                                                                          
+                                                                                                                                                                                                                  
+  At alpha=1.48, pi_soft(best) ≈ 1/n_avail = 0.067 (near-uniform). The current alpha_max=1.0 doesn't even approach uniform. The behavioral labels in the table are misleading.                                    
+                                                                                                                                                                                                                  
+  ---                                                                                                                                                                                                             
+  Complete Cross-Component Failure Chain
+                                        
+  Putting all four components together in a concrete SMACv2 scenario to show the compound effect:
+                                                                                                                                                                                                                  
+  Setup: 5v5 Protoss, t=80/150, 2 Zealots flanking, 3 Stalkers clustered.
+         Low-HP enemy in range of flanking Zealots.                                                                                                                                                               
+                                                                                                                                                                                                                  
+  C1 (tanh): Q_raw(attack) grows, tanh clips Q(attack)→ 2.0 for all.                                                                                                                                              
+             DeltaQ = 2.0 - 0.4 (avg of moves/stop) ≈ 1.6 for flankers.                                                                                                                                           
+                                                                                                                                                                                                                  
+  C3 (InfoNCE): Zealots (flanking) → diverse obs → high InfoNCE loss →                                                                                                                                            
+                coord_signal ≈ 0.75 (after enough EMA settling).                                                                                                                                                  
+                Stalkers (clustered) → similar obs → low InfoNCE → coord_signal ≈ 0.05.                                                                                                                           
+                                                                                                                                                                                                                  
+  C4 (alpha mapping):                                                                                                                                                                                             
+    Zealots:  alpha_factor = 0.75, alpha_per = 0.75 * 1.6 = 1.2, alpha_eff = 1.2                                                                                                                                  
+    Stalkers: alpha_factor = 0.05, alpha_per = 0.05 * 1.6 = 0.08, alpha_eff = max(0.08, 0.005) = 0.08                                                                                                             
+                                                                                                                                                                                                                  
+  C2 (V_soft):                                                                                                                                                                                                    
+    Zealots:  softmax(Q/1.2). Q(attack)/1.2 = 2/1.2 = 1.67.                                                                                                                                                       
+              pi_soft(attack) ≈ exp(1.67)/(exp(1.67) + 5*exp(0)) ≈ 5.3/10.3 ≈ 0.51                                                                                                                                
+              V_soft_zealot ≈ 0.51*2.0 + 0.49*0.3 ≈ 1.17                                                                                                                                                          
+    Stalkers: softmax(Q/0.08). Q(attack)/0.08 = 25. exp(25)/(exp(25)+...) ≈ 1.0                                                                                                                                   
+              V_soft_stalker ≈ V_hard ≈ 2.0                                                                                                                                                                       
+                                                                                                                                                                                                                  
+  Q_total_target = NMixer([1.17, 1.17, 2.0, 2.0, 2.0], state)                                                                                                                                                     
+                 < NMixer([2.0, 2.0, 2.0, 2.0, 2.0], state) = Q_total_target_QMIX                                                                                                                                 
+                                                                                                                                                                                                                  
+  TD error: Q_online_tot must match Q_total_target_CASVD < Q_total_target_QMIX.                                                                                                                                   
+  Mixer learns: Zealot attacks are worth 1.17/2.0 = 58.5% of their true value.                                                                                                                                    
+  Policy consequence: Zealots stop flanking and move toward cluster (where coord_signal drops).                                                                                                                   
+  Final learned strategy: 5-agent cluster → suboptimal → lower win rate vs QMIX.                                                                                                                                  
+                                                                                                                                                                                                                  
+  ---                                                                                                                                                                                                             
+  Summary Table                                                                                                                                                                                                   
+                                                                                                                                                                                                                  
+  ┌──────────────────────────────────────────────────────────────────────────┬──────────────┬────────────────────────────────────────────────────────────────┐
+  │                                 Problem                                  │   Severity   │                          Core damage                           │                                                    
+  ├──────────────────────────────────────────────────────────────────────────┼──────────────┼────────────────────────────────────────────────────────────────┤
+  │ V_soft ≤ V_QMIX always — no upside possible                              │ Catastrophic │ Algorithm cannot mathematically outperform QMIX                │
+  ├──────────────────────────────────────────────────────────────────────────┼──────────────┼────────────────────────────────────────────────────────────────┤
+  │ alpha_floor=0.005 + tanh Q → float32 NaN for all well-coordinated agents │ Catastrophic │ Training crashes whenever an agent learns good coordination    │                                                    
+  ├──────────────────────────────────────────────────────────────────────────┼──────────────┼────────────────────────────────────────────────────────────────┤                                                    
+  │ alpha_factor = coord_signal = identity mapping — no added value          │ Critical     │ Component adds no transformation; all design work elsewhere    │                                                    
+  ├──────────────────────────────────────────────────────────────────────────┼──────────────┼────────────────────────────────────────────────────────────────┤                                                    
+  │ Per-agent alpha injects non-stationarity into mixer                      │ Critical     │ Mixing weights must track changing per-agent pessimism         │
+  ├──────────────────────────────────────────────────────────────────────────┼──────────────┼────────────────────────────────────────────────────────────────┤                                                    
+  │ Flanking strategy systematically penalized                               │ Critical     │ Optimal SMACv2 strategies actively suppressed                  │
+  ├──────────────────────────────────────────────────────────────────────────┼──────────────┼────────────────────────────────────────────────────────────────┤                                                    
+  │ "Exploration" rationale is mechanistically wrong                         │ Critical     │ Soft targets = pessimism, not behavioral exploration           │
+  ├──────────────────────────────────────────────────────────────────────────┼──────────────┼────────────────────────────────────────────────────────────────┤                                                    
+  │ DeltaQ=0.04 example causes NaN at all coordination levels                │ Significant  │ Table illustrates failure, not intended behavior               │
+  ├──────────────────────────────────────────────────────────────────────────┼──────────────┼────────────────────────────────────────────────────────────────┤                                                    
+  │ alpha_max=1.0 uncalibrated to action space and Q-scale                   │ Significant  │ "Maximum exploration" is barely softer than greedy             │
+  ├──────────────────────────────────────────────────────────────────────────┼──────────────┼────────────────────────────────────────────────────────────────┤                                                    
+  │ EMA-frozen coord_signal makes alpha_factor near-constant                 │ Moderate     │ Per-agent adaptation is effectively a fixed constant per agent │
+  └──────────────────────────────────────────────────────────────────────────┴──────────────┴────────────────────────────────────────────────────────────────┘  
+
+
+
+
+
+  claude --resume 1da71a44-403b-4ada-8b1e-7ba4cc6cface

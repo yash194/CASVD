@@ -1,0 +1,259 @@
+Critical Analysis: Component 1 — Structured Entity Attention
+                                                                             
+  I'll go sub-component by sub-component, in severity order within each.                                                                                                                                          
+                                                                                                                                                                                                                  
+  ---                                                                                                                                                                                                             
+  Entity Encoding                                                                                                                                                                                                 
+                                                                                                                                                                                                                  
+  Issue 1 — Self-node conflates movement availability with agent state
+                                                                                                                                                                                                                  
+  self_node = ReLU(W_self * [move_feats || own_feats])
+                                                                                                                                                                                                                  
+  In SMACv2's observation, move_feats is a binary action-availability mask — it encodes whether pathing_grid[x ± m/2, y ± m/2] is passable. This is a constraint derived from current position, not an intrinsic  
+  agent property. own_feats is intrinsic (health, shield, type, attack_prob). Concatenating them before W_self forces a single linear layer to simultaneously learn "I am healthy" and "I am near a wall" in the  
+  same subspace.                                                                                                                                                                                                  
+                  
+  Impact on SMACv2: On the 32×32 flat map (used in all generative scenarios), the pathing grid is largely open. move_feats will almost always be [1,1,1,1] except at map edges — near-constant input dims that add
+   noise to the self embedding with no signal. More importantly, when random_start=True, agents spawn in arbitrary positions where edge proximity varies per episode, making the move-feat embedding inconsistent
+  across episodes. These features belong in the action-mask, not the self-node query.                                                                                                                             
+                  
+  Fix direction: separate W_move and W_own projections; sum or gate them rather than concatenating before the shared projection.                                                                                  
+  
+  ---                                                                                                                                                                                                             
+  Issue 2 — ReLU on all entity encoders kills negative feature correlations
+                                                                                                                                                                                                                  
+  ally_nodes = ReLU(W_ally * ally_feats)
+  enemy_nodes = ReLU(W_enemy * enemy_feats)                                                                                                                                                                       
+                                                                                                                                                                                                                  
+  The raw ally/enemy features include signed relative positions Δx/sight_range, Δy/sight_range ∈ [-1, +1]. A unit to the west has Δx < 0, a unit to the east has Δx > 0. After W_ally * ally_feats, the linear    
+  combination of these signed values can produce meaningful negative activations. ReLU kills all of them in the first layer. The network loses half its representational capacity for spatial relationships before
+   attention even runs.                                                                                                                                                                                           
+                  
+  In SMACv2 specifically: coordinating fire from different sides requires the network to distinguish Δx = -0.8 (far west) from Δx = +0.8 (far east). After ReLU, both could map to 0 if the corresponding weight  
+  row has w < 0 for that feature. You're systematically discarding half the spatial encoding at the gate.
+                                                                                                                                                                                                                  
+  Fix direction: ELU or no activation on entity encoders. Keep raw linear embeddings.                                                                                                                             
+  
+  ---                                                                                                                                                                                                             
+  LocalEntityGAT  
+                                                                                                                                                                                                                  
+  Issue 3 — Self-node appears as both query AND entity 0 in the KV set
+                                                                                                                                                                                                                  
+  entity_nodes = stack([self_node.unsqueeze(2), ally_nodes, enemy_nodes], dim=2)
+  Q = W_Q * s_i     # query from self_node                                                                                                                                                                        
+  K[0] = W_K * s_i  # key for entity 0 = also self_node
+                                                                                                                                                                                                                  
+  The self-node generates the query Q AND occupies entity slot 0 in the key-value pool. The attention score for entity 0 is:                                                                                      
+                                                                                                                                                                                                                  
+  logit_h(i, 0) = (W_Q s_i)^T (W_K s_i) / sqrt(32)                                                                                                                                                                
+                = s_i^T W_Q^T W_K s_i / sqrt(32)                                                                                                                                                                  
+  
+  This is a quadratic form in s_i — it's a learned similarity of the self-embedding with itself, always positive for learned positive-semidefinite W_Q^T W_K. Early in training this will dominate attention      
+  (self-attending collapses the output toward the self embedding), making the residual connection redundant. Later, this creates a competing gradient path: the self-information enters through two routes (entity
+   0 → attention → output, and directly via residual), with different gradient magnitudes. The network can learn either path, creating optimization instability.                                                  
+                  
+  Impact on SMACv2: At the start of training, this encourages agents to ignore enemies/allies entirely and focus attention on their own state. Since the initial reward signal in SMACv2 is sparse (kills take    
+  many steps), this self-attention bias can persist for thousands of gradient steps before it gets corrected.
+                                                                                                                                                                                                                  
+  ---             
+  Issue 4 — ELU applied after residual connection
+
+  local_summary(i) = output(i) + s_i     # residual
+  local_summary = ELU(local_summary)      # nonlinearity AFTER residual                                                                                                                                           
+  
+  Standard residual networks (ResNets, transformers) apply the activation before the residual or use pre-norm. Applying ELU after the residual means:                                                             
+                  
+  If output(i) ≈ -s_i  (destructive interference), ELU(≈0) ≈ 0                                                                                                                                                    
+                                                                                                                                                                                                                  
+  The entire local context is zeroed out. This is not a gradient-killing issue per se, but it means the residual connection can be "cancelled" by the attention output, removing both signals. More critically:   
+  ELU maps negative residuals through α(e^x - 1) which compresses large negative values exponentially. If output(i) has learned a large negative correction to s_i, the ELU asymptote clips that correction.      
+                                                                                                                                                                                                                  
+  In SMACv2 with stochastic attack probabilities, an agent with low p_attack needs to learn a very different local summary than one with high p_attack — the attention correction output(i) should be able to     
+  shift the self-embedding significantly in any direction. ELU after residual limits the downward correction range.
+                                                                                                                                                                                                                  
+  ---             
+  TeamGATLayer
+              
+  Issue 5 — CRITICAL: No dead-agent mask in TeamGAT
+                                                                                                                                                                                                                  
+  h_i = W * local_summary_i     # for ALL agents including dead ones
+  e_{ij} = LeakyReLU(a_src·h_i + a_dst·h_j)                                                                                                                                                                       
+                                                                                                                                                                                                                  
+  Dead agents have health=0, so get_obs_agent returns all-zeros. Their entity encodings are ReLU(W * 0) = 0. Their LocalEntityGAT output runs on a zero input query. After LocalEntityGAT + residual + ELU +      
+  LayerNorm:                                                                                                                                                                                                      
+                                                                                                                                                                                                                  
+  LayerNorm(x) = (x - μ) / (σ + ε) * γ + β
+                                                                                                                                                                                                                  
+  For a dead agent where x ≈ 0: μ ≈ 0, σ ≈ 0, so LayerNorm(0) ≈ β — the learned bias vector β ∈ R^128. This is not zero. Dead agents emit their β vector into the TeamGAT.                                        
+                                                                                                                                                                                                                  
+  Consequence: every alive agent attends over n_agents embeddings, of which n_dead emit the spurious β vector. As the battle progresses and more agents die, an increasing proportion of the TeamGAT's key-value  
+  pool is β. The alive agents' attention weights are distorted by this ghost signal. In a 10v10
+                                                                                                                                                                                                                  
+⏺ This is a rich component. I'll go through it surgically — each sub-piece against the exact SMACv2 math and dynamics we've established.
+                                                                             
+  ---
+  Critical Analysis — Component 1: Structured Entity Attention + GRU + Q-Head                                                                                                                                     
+                                                                                                                                                                                                                  
+  ---                                                                                                                                                                                                             
+  Problem 1 (CATASTROPHIC): tanh Q-value squashing to [-2.0, +2.0]                                                                                                                                                
+                                                                                                                                                                                                                  
+  This is the single most damaging decision in the entire component and will cap learning before it starts.                                                                                                       
+                                                                                                                                                                                                                  
+  The actual Q-value range in SMACv2:
+                                                                                                                                                                                                                  
+  For a 10v10 Protoss scenario with reward scaling rate=20:                                                                                                                                                       
+  divisor = max_reward / reward_scale_rate
+          = (10 * 10 + 200) / 20 = 15                                                                                                                                                                             
+                                     
+  per-step damage reward ≈ Δenemy_HP / divisor ≈ 4–6 HP/step / 15 ≈ 0.3/step                                                                                                                                      
+  win bonus = 200 / 15 ≈ 13.3                                                                                                                                                                                     
+                                                                                                                                                                                                                  
+  Q(t=0) ≈ Σ_{k=0}^{T} γ^k * r_k   with γ=0.99, T=200                                                                                                                                                             
+          ≈ 0.3 * (1 - 0.99^200)/(1-0.99) + 13.3 * 0.99^{T_end}                                                                                                                                                   
+          ≈ 0.3 * 86.6 + 13.3 * 0.37                                                                                                                                                                              
+          ≈ 26 + 4.9  ≈ 31                                                                                                                                                                                        
+                          
+  Your Q-values represent discounted cumulative returns in [0, ~31]. Your tanh caps them at [-2, +2]. This means 95% of the value space is unrepresentable.                                                       
+                                                                                                                                                                                                                  
+  The gradient death is progressive:                                                                                                                                                                              
+                                                                                                                                                                                                                  
+  ∂Q/∂Q_raw = q_output_scale * (1 - tanh²(Q_raw))                                                                                                                                                                 
+             → 0  as  Q_raw grows beyond ~2                                                                                                                                                                       
+                                                                                                                                                                                                                  
+  At initialization (orthogonal gain=0.1), Q_raw ≈ small, so tanh ≈ linear — fine. But as TD targets push Q_raw upward, tanh saturates and ∂L/∂θ ≈ 0. The network stalls in the first few thousand episodes. QMIX 
+  uses a linear Q-head precisely to avoid this.                                                                                                                                                                   
+                                                                                                                                                                                                                  
+  Fix: Remove tanh entirely. Use a linear output layer, or if you want bounded outputs, use a much larger scale (≥ 50) and monitor Q_raw magnitudes empirically.                                                  
+  
+  ---                                                                                                                                                                                                             
+  Problem 2 (CRITICAL): TeamGAT has no mask for dead agents
+                                                                                                                                                                                                                  
+  In SMACv2, agents die mid-episode. A dead agent's local_summary is computed from a zero observation vector:
+                                                                                                                                                                                                                  
+  # From get_obs_agent:
+  if unit.health > 0:                                                                                                                                                                                             
+      ... fill features ...                                                                                                                                                                                       
+  # else: all zeros returned                                                                                                                                                                                      
+                                                                                                                                                                                                                  
+  So dead agent i produces:
+  self_node_i = ReLU(W_self * 0) = 0   (unless bias exists — there's no bias in encoder)                                                                                                                          
+  ally/enemy feats = 0                                                                  
+  local_summary_i ≈ W_out * (attention over zeros) + 0 = bias_out                                                                                                                                                 
+                                                                 
+  This is not zero — it's the bias of W_out. All dead agents converge to the same nonzero summary (the bias vector). The TeamGAT then attends to these identical ghost summaries with no masking, polluting every 
+  living agent's team embedding.                                                                                                                                                                                  
+                                                                                                                                                                                                                  
+  In a 10v10 map, if 6 agents die, 6 identical bias vectors are attending to the 4 alive agents. The team attention becomes dominated by these meaningless embeddings, and the alive agents' Q-values are         
+  corrupted precisely when coordination is most critical.
+                                                                                                                                                                                                                  
+  Fix: Pass an alive_mask: [B, n_agents] into TeamGAT and set logits for dead agents to -1e9 before the team softmax, analogous to what LocalGAT does with entity_mask.                                           
+  
+  ---                                                                                                                                                                                                             
+  Problem 3 (CRITICAL): TeamGAT cross-conditions Q_i on other agents' observations
+                                                                                                                                                                                                                  
+  The TeamGAT computes:
+  team_summary_i = Σ_j α_{ij} * h_j                                                                                                                                                                               
+                                   
+  where h_j is a function of agent j's observation o_j. Therefore:                                                                                                                                                
+  Q_i = f(o_i, o_1, ..., o_n, a_i)                                                                                                                                                                                
+                                                                                                                                                                                                                  
+  This has two compounding consequences:                                                                                                                                                                          
+                                                                                                                                                                                                                  
+  A — Non-stationarity amplification: During training, all agents' policies are simultaneously changing. Because Q_i depends on all o_j, when agent j's network parameters update, agent i's Q_i changes even     
+  without any change to i's own parameters. The effective non-stationarity is now O(n_agents) times worse than standard per-agent Q-values. This is known to destabilize TD learning in MARL.                     
+                                                                                                                                                                                                                  
+  B — QMIX IGM consistency tension: QMIX's factorization is:                                                                                                                                                      
+  argmax_{a} Q_tot(s, a) = [argmax_{a_i} Q_i(τ_i, a_i)]_i
+                                                                                                                                                                                                                  
+  When Q_i(τ_i, a_i) secretly depends on τ_j for all j through the TeamGAT, the greedy per-agent maximization at execution time would require each agent to know other agents' observation histories. In PyMARL2's
+   centralized simulation this doesn't crash, but it means the policy is implicitly centralized while being formally treated as decentralized. The Q_i values you're learning are not the ones being evaluated at 
+  test time if the TeamGAT is disabled per-agent.                                                                                                                                                                 
+                                                                                                                                                                                                                  
+  ---             
+  Problem 4 (SIGNIFICANT): Self-node is simultaneously the query AND a key-value entity
+                                                                                                                                                                                                                  
+  entity_nodes = stack([self_node.unsqueeze(2), ally_nodes, enemy_nodes], dim=2)
+  # self_node is both Q's source AND E[0] in the key-value set                                                                                                                                                    
+                                                                                                                                                                                                                  
+  The attention score of self against self:                                                                                                                                                                       
+  logit(i, self) = (Q_i^h · K_i^h) / sqrt(32)                                                                                                                                                                     
+                                                                                                                                                                                                                  
+  Since both come from the same s_i via the same W_Q and W_K, this inner product can be arbitrarily large compared to cross-entity scores, causing attention collapse to self. The network learns to mostly attend
+   to itself (maximizing self-similarity score), reducing the full multi-entity attention to approximately:                                                                                                       
+                                                                                                                                                                                                                  
+  output_i ≈ V_i^h * α(i, i) + noise                                                                                                                                                                              
+                                                                                                                                                                                                                  
+  which is just a linear transform of s_i — no richer than a standard MLP. You can verify this by monitoring attention entropy: if it's consistently low and concentrated on entity index 0 (self), this is the   
+  failure mode.                                                                                                                                                                                                   
+                                                                                                                                                                                                                  
+  Fix: Exclude self from the key-value entity set. Keep it only as the query. Use a separate residual for the self-information.                                                                                   
+  
+  ---                                                                                                                                                                                                             
+  Problem 5 (SIGNIFICANT): No residual connection in TeamGAT
+                                                                                                                                                                                                                  
+  LocalGAT has:
+  local_summary = output + s_i    ← residual preserves self-information                                                                                                                                           
+                  
+  TeamGAT has no such residual:                                                                                                                                                                                   
+  team_summary_i = ELU(Σ_j α_{ij} * h_j)   ← pure aggregation
+                                                                                                                                                                                                                  
+  After TeamGAT, the GRU input is:                                                                                                                                                                                
+  gru_input = [local_summary || team_summary]                                                                                                                                                                     
+                                                                                                                                                                                                                  
+  The local_summary carries the self-signal. But team_summary has no self-residual. In SMACv2, the most important signal for action selection is almost always the agent's own state (own health, cooldown,       
+  whether enemies are in shoot range). The additive attention:                                                                                                                                                    
+  
+  e_src_i = h_i · a_src   →  scalar that biases ALL outgoing attention from i                                                                                                                                     
+                                                                                                                                                                                                                  
+  does not guarantee that agent i gives high weight to itself in the aggregation. An agent may upweight a high-HP nearby ally while downweighting itself. This is fine for communication but dilutes the critical 
+  own-state signal entering the GRU.                                                                                                                                                                              
+                                                                                                                                                                                                                  
+  ---             
+  Problem 6 (SIGNIFICANT): Extra features injected AFTER attention, not before
+                                                                                                                                                                                                                  
+  local_summary = local_summary + ReLU(W_extra * extras)
+                                                                                                                                                                                                                  
+  If extras includes agent-ID one-hot and last action, these are added after the attention computation. This means:                                                                                               
+                                                                                                                                                                                                                  
+  - W_Q, W_K, W_V project entity features with no knowledge of which agent this is or what action it took last                                                                                                    
+  - All agents with identical local observations produce identical Q, K, V projections
+  - The attention weights α(i, e) are the same for all agents in the same local context                                                                                                                           
+                                                                                                                                                                                                                  
+  In SMACv2 with shared encoders (ns = non-shared? the file is gat_ns_agent.py), this matters less if weights aren't shared. But if agents share encoder weights (the _ns suffix typically means non-shared       
+  weights in PyMARL2), verify this. Either way, the last action critically determines what's legally available next (cooldown state), and it's not conditioning the attention — only the final embedding.         
+                                                                                                                                                                                                                  
+  ---             
+  Problem 7 (MODERATE): GRU input dimensionality 256 vs standard obs_dim
+                                                                                                                                                                                                                  
+  Standard QMIX on SMACv2 uses GRU input = obs_size (typically 30–80 for 5v5, up to ~200 for 10v10) and hidden_dim = 64. You're using:
+                                                                                                                                                                                                                  
+  gru_input = 256 (128 local + 128 team)
+  gru_hidden = 128                                                                                                                                                                                                
+                  
+  This is a 4–8x larger GRU than standard QMIX. In SMACv2, each episode produces T * n_agents transitions. For T=200, n=10: 2000 transitions per episode. The larger GRU needs substantially more gradient steps  
+  to fit. Combined with the non-stationarity from TeamGAT (Problem 3), this means slower convergence and the Q-values from QMIX (simpler model, less variance) will outperform until very late in training — and
+  you probably never reach that point in standard evaluation windows (2M–10M env steps).                                                                                                                          
+                  
+  ---
+  Summary Table
+               
+  ┌────────────────────────────────┬──────────────┬─────────────────────────────────────────────────┬─────────────────────────────────────────┐
+  │            Problem             │   Severity   │                    Mechanism                    │           Where it hurts most           │                                                                   
+  ├────────────────────────────────┼──────────────┼─────────────────────────────────────────────────┼─────────────────────────────────────────┤
+  │ tanh Q-head saturation         │ Catastrophic │ Gradient death as Q_raw > 2                     │ All maps, early-mid training            │                                                                   
+  ├────────────────────────────────┼──────────────┼─────────────────────────────────────────────────┼─────────────────────────────────────────┤
+  │ Dead agent TeamGAT pollution   │ Critical     │ Ghost summaries corrupt alive agents            │ Mid-late episode, high-casualty maps    │                                                                   
+  ├────────────────────────────────┼──────────────┼─────────────────────────────────────────────────┼─────────────────────────────────────────┤                                                                   
+  │ TeamGAT cross-obs conditioning │ Critical     │ Non-stationarity × n_agents, centralized policy │ All maps with coordination              │                                                                   
+  ├────────────────────────────────┼──────────────┼─────────────────────────────────────────────────┼─────────────────────────────────────────┤                                                                   
+  │ Self as key-value entity       │ Significant  │ Attention collapse to self                      │ Dense-entity scenarios                  │
+  ├────────────────────────────────┼──────────────┼─────────────────────────────────────────────────┼─────────────────────────────────────────┤                                                                   
+  │ TeamGAT no residual            │ Significant  │ Own-state dilution in aggregation               │ Health-critical decisions               │
+  ├────────────────────────────────┼──────────────┼─────────────────────────────────────────────────┼─────────────────────────────────────────┤                                                                   
+  │ Extra features post-attention  │ Significant  │ Last action doesn't gate attention              │ Cooldown-heavy units (Stalker/Marauder) │
+  ├────────────────────────────────┼──────────────┼─────────────────────────────────────────────────┼─────────────────────────────────────────┤                                                                   
+  │ GRU 256-input oversized        │ Moderate     │ Slow convergence, needs more data               │ All maps, early training                │
+  └────────────────────────────────┴──────────────┴─────────────────────────────────────────────────┴─────────────────────────────────────────┘                                                                   
+                  
+  Fix the tanh issue first — it's actively breaking the learning signal regardless of how good the attention is. The network could have perfect entity representations and it still won't learn because the TD    
+  gradient dies at the Q-head.

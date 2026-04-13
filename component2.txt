@@ -1,0 +1,405 @@
+Critical Analysis — Component 2: Q-Spread-Relative Soft Values (CASVD)
+                                                                                                              
+  ---
+  Problem 1 (CATASTROPHIC): The Feedback Loop Is Anti-Learning in the Regime Where Learning Is Working                                                                                                            
+   
+  The claimed feedback loop:                                                                                                                                                                                      
+                  
+  ΔQ grows → α grows → pi_soft softens → V_soft suppresses extremes → ΔQ shrinks
+                                                                                                                                                                                                                  
+  This is described as "self-stabilizing." But look at what ΔQ growing actually means:
+                                                                                                                                                                                                                  
+  ΔQ(s, i) = max_a Q(s,i,a) - mean_a Q(s,i,a)   grows   ⟺
+  the agent is learning which actions are decisively better than others                                                                                                                                           
+                                                                                                                                                                                                                  
+  Large ΔQ = the network has found a good policy. An agent that has learned "attack enemy 3 is far better than moving" has large ΔQ. The correct response is to sharpen the policy around that dominant action.   
+  Your mechanism does the exact opposite:                                                                                                                                                                         
+                                                                                                                                                                                                                  
+  ΔQ large → α = factor * ΔQ large → pi_soft = softmax(Q/α) becomes flat
+                                                                                                                                                                                                                  
+  You're softening the policy precisely when it has become informed. The gradient that flows back through V_soft into Q_target is then:                                                                           
+                                                                                                                                                                                                                  
+  ∂V_soft/∂Q(a) = pi_soft(a) + Σ_{a'} pi_soft(a') * Q(a') * ∂pi_soft(a')/∂Q(a)                                                                                                                                    
+                                                                                                                                                                                                                  
+  When pi_soft is flat (large α), every action gets roughly equal gradient weight. The network can't strengthen the dominant action because the soft value is pulling all Q-values toward each other. This is a   
+  convergence brake activated exactly at learning progress.                                                                                                                                                       
+                                                                                                                                                                                                                  
+  The self-stabilizing claim conflates two distinct phenomena:                                                                                                                                                    
+  - Value scale explosion (Q-values growing without bound in magnitude) — a real problem
+  - Q-spread growth (ΔQ growing as the policy improves) — not a problem, this is learning                                                                                                                         
+                                                                                         
+  ΔQ can grow even if the absolute scale of Q is constant (e.g., Q shifts from [1,1,1,1] to [1,1,1,4] — same scale, large ΔQ). Your mechanism penalizes both, when only the former is pathological.               
+                                                                                                                                                                                                                  
+  ---                                                                                                                                                                                                             
+  Problem 2 (CATASTROPHIC): The Mechanism Is Inverted Against SMACv2's Asymmetric Action Space                                                                                                                    
+                                                                                                                                                                                                                  
+  In SMACv2, the action space is structurally split:
+                                                                                                                                                                                                                  
+  A_i = {no-op, stop, N, S, E, W}  ∪  {attack_e : e in range}
+                                                                                                                                                                                                                  
+  Consider agent i with one enemy in shoot range. Typical Q-value distribution:                                                                                                                                   
+  Q(attack_0) = 1.8    ← high, enemy is low health                                                                                                                                                                
+  Q(move_N)   = 0.3                                                                                                                                                                                               
+  Q(move_S)   = 0.3                                                                                                                                                                                               
+  Q(move_E)   = 0.2                                                                                                                                                                                               
+  Q(move_W)   = 0.2                                                                                                                                                                                               
+  Q(stop)     = 0.1                                                                                                                                                                                               
+                                                                                                                                                                                                                  
+  Q_max  = 1.8
+  Q_mean = (1.8 + 0.3 + 0.3 + 0.2 + 0.2 + 0.1) / 6 = 0.483                                                                                                                                                        
+  ΔQ     = 1.8 - 0.483 = 1.317  →  large                                                                                                                                                                          
+  α      = factor * 1.317       →  large                                                                                                                                                                          
+  pi_soft is SOFT  →  probability mass bleeds onto move actions                                                                                                                                                   
+                                                                                                                                                                                                                  
+  Now consider agent i with NO enemies in range. Only movement available:                                                                                                                                         
+  Q(move_N) = 0.4, Q(move_S) = 0.35, Q(move_E) = 0.3, Q(move_W) = 0.25, Q(stop)=0.1                                                                                                                               
+  Q_max  = 0.4,  Q_mean = 0.28,  ΔQ = 0.12  →  small                                                                                                                                                              
+  α      = small  →  pi_soft is SHARP                                                                                                                                                                             
+                                                                                                                                                                                                                  
+  The mechanism is literally backwards for SMACv2: The policy is sharpest (most decisive) when no enemies are in range (trivial decision), and softest (most diffuse) when an enemy is in range (critical         
+  decision). This directly translates to attacking less reliably → fewer kills → lower win rate. The asymmetry between attack and move Q-values in SMACv2 is intrinsic — attacks are almost always higher-value   
+  than retreating when enemies are alive. Your ΔQ will always be large in combat situations, always triggering soft policies exactly when hard attack decisions are needed.
+                                                                                                                                                                                                                  
+  ---             
+  Problem 3 (CRITICAL): ΔQ Is Sensitive to n_avail, Not Just Q-Spread
+                                                                                                                                                                                                                  
+  Q_mean = (Σ_{avail} Q(a)) / |avail|
+                                                                                                                                                                                                                  
+  The mean denominator changes throughout the episode as enemies die:                                                                                                                                             
+                                                                                                                                                                                                                  
+  ┌──────────────────────────┬─────────┬──────────────────────────────┐                                                                                                                                           
+  │          State           │ n_avail │      Q_mean composition      │
+  ├──────────────────────────┼─────────┼──────────────────────────────┤                                                                                                                                           
+  │ t=0, all 10 alive        │ 16      │ diluted by 10 enemy Q-values │
+  ├──────────────────────────┼─────────┼──────────────────────────────┤
+  │ t=50, 5 enemies dead     │ 11      │ diluted by 5                 │
+  ├──────────────────────────┼─────────┼──────────────────────────────┤                                                                                                                                           
+  │ t=150, 1 enemy remaining │ 7       │ diluted by 1                 │
+  └──────────────────────────┴─────────┴──────────────────────────────┘                                                                                                                                           
+                  
+  As enemies die, n_avail shrinks. The surviving enemy's Q-value stays high. Q_mean is now averaged over fewer low-value move actions, so Q_mean rises. ΔQ = Q_max - Q_mean actually decreases as the game        
+  progresses toward the final kill — the most critical moment of the episode. α decreases → pi_soft sharpens → this is coincidentally the right behavior at the end — but for entirely the wrong reason. The
+  behavior is correct by accident and fragile.                                                                                                                                                                    
+                  
+  More importantly: when the first kills happen mid-episode, each newly-dead enemy removes one high-Q attack action from avail. Q_mean suddenly drops (one less high-Q term). ΔQ jumps. α jumps. Policy softens.  
+  The enemy deaths cause discontinuous temperature spikes — abrupt softening of the policy at exactly the moments when agents are succeeding (killing enemies). This destabilizes the value targets exactly when
+  learning signals should be reinforcing.                                                                                                                                                                         
+                  
+  ---
+  Problem 4 (CRITICAL): The Scale-Invariance Proof Is Vacuous
+                                                             
+  The proof assumes: Q'(s,i,a) = c * Q(s,i,a) for ALL s, i, a with the same constant c.
+                                                                                                                                                                                                                  
+  This never happens in practice. What actually happens during training:                                                                                                                                          
+                                                                                                                                                                                                                  
+  - Different agents have different Q-spreads (agent near an enemy has large ΔQ; agent far away has small ΔQ)                                                                                                     
+  - Different actions have different learning rates (attack Q-values update fast from kill rewards; move Q-values update slowly)
+  - Q-values at different states scale differently (early-game states vs late-game states)                                                                                                                        
+                                                                                                                                                                                                                  
+  The proof holds only for the trivial case where a constant multiplied equally across all Q-values. Under any real non-uniform Q-value evolution, scale-invariance breaks. This is a mathematical result about a 
+  property that doesn't exist in the training dynamics.                                                                                                                                                           
+                                                                                                                                                                                                                  
+  Concretely: if you multiply ALL Q-values by 2 (the c=2 case), alpha doubles, and pi_soft is identical. But in reality, Q(attack) might double while Q(move) stays constant. Then:                               
+   
+  ΔQ' = 2*Q(attack) - (2*Q(attack) + Q(move_N) + ... ) / n_avail                                                                                                                                                  
+      ≠ 2 * ΔQ                                                                                                                                                                                                    
+                                                                                                                                                                                                                  
+  The scale invariance doesn't hold when only the dominant Q-value scales.                                                                                                                                        
+                                                                                                                                                                                                                  
+  ---                                                                                                                                                                                                             
+  Problem 5 (CRITICAL): Components 1 and 2 Are Architecturally Contradictory
+                                                                            
+  Component 1 hard-caps Q-values to [-2, 2] via tanh. Component 2 claims to prevent Q-value explosion via dynamic temperature α. They're solving the same problem with contradictory mechanisms:
+                                                                                                                                                                                                                  
+  tanh cap:   prevents explosion by clamping Q_raw output range                                                                                                                                                   
+  dynamic α:  claims to prevent explosion by softening policy when Q grows                                                                                                                                        
+                                                                                                                                                                                                                  
+  But with tanh in place, ΔQ ≤ Q_max - Q_min ≤ 4 always. The Q-values cannot explode. The self-stabilizing loop was never needed. But now with α = factor * ΔQ ≤ factor * 4, the maximum temperature is           
+  hard-bounded, the minimum is 0.005, and the entire dynamic range of α is compressed:                                                                                                                            
+                                                                                                                                                                                                                  
+  α ∈ [0.005,  4 * alpha_factor]
+                                                                                                                                                                                                                  
+  The feedback loop that Component 2 claims regulates training is operating over a tiny range determined by Component 1's constraint. The two mechanisms are redundant at best, contradictory at worst: the tanh  
+  cap is too aggressive (kills gradients for large Q_raw), while the dynamic temperature is unnecessary (Q can't explode). You have two guardrails that each assume the other doesn't exist.                      
+                                                                                                                                                                                                                  
+  ---             
+  Problem 6 (CRITICAL): Pessimistic Bias Systematically Suppresses Winning Targets
+                                                                                                                                                                                                                  
+  Mathematically, for any distribution over a finite set:
+                                                                                                                                                                                                                  
+  V_soft = E_{pi_soft}[Q_target] ≤ max_a Q_target = V_hard
+                                                                                                                                                                                                                  
+  With equality only when pi_soft is a delta at the optimal action (α → 0). This means all soft value targets are ≤ QMIX's hard-max targets, at every state, every agent, every timestep. The TD-lambda return    
+  becomes:                                                                                                                                                                                                        
+                                                                                                                                                                                                                  
+  G_t^soft = r_t + γ * [(λ) * G_{t+1}^soft + (1-λ) * NMixer(V_soft, s_{t+1})]
+           < r_t + γ * [(λ) * G_{t+1}^hard + (1-λ) * NMixer(V_hard, s_{t+1})]
+           = G_t^QMIX                                                                                                                                                                                             
+                                                                                                                                                                                                                  
+  Your targets are systematically smaller than QMIX's at every point in the return computation. The learned Q-values will underestimate the true return. Underestimated Q-values → more conservative greedy policy
+   → agents stop attacking earlier, retreat more → fewer kills → lower win rate.                                                                                                                                  
+                                                                                                                                                                                                                  
+  The magnitude of the pessimism bias in terms of the temperature:                                                                                                                                                
+   
+  V_soft - V_hard = -α * H(pi_soft)   (maximum entropy framework)                                                                                                                                                 
+                                                                                                                                                                                                                  
+  where H(pi_soft) is the Shannon entropy of the soft policy. Large α and large entropy → large pessimism. In SMACv2, winning requires aggressive forward pressure. A pessimistic value function teaches agents   
+  that attacking is worth less than it actually is.                                                                                                                                                               
+                                                                                                                                                                                                                  
+  ---             
+  Problem 7 (SIGNIFICANT): Double-Q Decoupling Is Incomplete — Circular Target Dependency
+                                                                                                                                                                                                                  
+  The claimed Double-Q scheme:
+                                                                                                                                                                                                                  
+  pi_soft  ←  online Q (detached)
+  V_soft   =  Σ_a pi_soft(a) * Q_target(a)                                                                                                                                                                        
+                                                                                                                                                                                                                  
+  But pi_soft depends on α = alpha_factor * ΔQ(online). And alpha_factor is a per-agent adaptive parameter "driven by coordination signal" (Section 5, not yet described). If alpha_factor is updated during      
+  training via gradients from the loss, then:                                                                                                                                                                     
+                                                                                                                                                                                                                  
+  target = NMixer(V_soft, s) where V_soft depends on alpha_factor(θ)
+                                                                                                                                                                                                                  
+  The target is a function of θ (current parameters) through alpha_factor. This reintroduces the moving-target problem that Double-Q was designed to eliminate. Standard Double-Q decouples: "online selects      
+  action, target evaluates." CASVD couples: "online determines temperature through alpha_factor,                                                                                                                  
+                                                                                                                                                                                                                  
+⏺ Critical Analysis — Component 2: Q-Spread-Relative Soft Values  
+                                                                                                              
+  ---
+  Problem 1 (CATASTROPHIC): The Temperature–Certainty Relationship is Completely Inverted                                                                                                                         
+                                                                                                                                                                                                                  
+  This is the core mathematical flaw of the component. Let me prove it precisely.                                                                                                                                 
+                                                                                                                                                                                                                  
+  What DeltaQ actually measures:                                                                                                                                                                                  
+                                                                                                                                                                                                                  
+  DeltaQ(s,i) = Q_max(s,i) - Q_mean(s,i)                                                                                                                                                                          
+                  
+  This is the excess of the best action over the average action. It grows large when one action is clearly dominant. Examples:                                                                                    
+   
+  Case A — Uncertain (actions similar):                                                                                                                                                                           
+  Q = [0.3, 0.28, 0.31, 0.29, 0.30, 0.27]                                                                                                                                                                         
+  Q_max = 0.31, Q_mean = 0.292, DeltaQ = 0.018   → small                                                                                                                                                          
+                                                                                                                                                                                                                  
+  Case B — Certain (one dominant action):                                                                                                                                                                         
+  Q = [2.0, 0.01, 0.00, -0.01, 0.02, 0.00]       ← attack correct enemy                                                                                                                                           
+  Q_max = 2.0,  Q_mean = 0.337,  DeltaQ = 1.663   → large                                                                                                                                                         
+                                                                                                                                                                                                                  
+  What CASVD does with this:                                                                                                                                                                                      
+                                                                                                                                                                                                                  
+  alpha = alpha_factor * DeltaQ
+
+  So:                                                                                                                                                                                                             
+  - Case A (uncertain): small DeltaQ → small alpha → sharp, near-deterministic policy
+  - Case B (certain): large DeltaQ → large alpha → diffuse, near-uniform policy                                                                                                                                   
+                                                                               
+  What should happen in correct temperature adaptation:                                                                                                                                                           
+                                                                                                                                                                                                                  
+  Uncertain policy  → explore more → HIGH alpha → diffuse
+  Certain policy    → exploit      → LOW alpha  → sharp                                                                                                                                                           
+                  
+  CASVD does the exact opposite. The correct formulation requires alpha ∝ 1/DeltaQ, not alpha ∝ DeltaQ. This is a sign flip in the feedback direction.                                                            
+                  
+  Impact on SMACv2 specifically:                                                                                                                                                                                  
+                  
+  In combat, the moment an enemy enters shoot range, the attack action gets a large Q-bonus. The Q-values correctly spread out — Q(attack) dominates all movement and stop actions. DeltaQ grows large. CASVD     
+  responds by increasing alpha, softening the policy, and spreading probability mass back over stop, retreat, and other attack targets. The algorithm actively prevents concentrating on the clearly optimal
+  attack action at exactly the moment it should commit.                                                                                                                                                           
+                  
+  The "self-stabilizing proof" correctly describes the feedback loop but misidentifies its direction. The system DOES reach equilibrium — but the equilibrium is at the wrong operating point: it penalizes       
+  Q-spread (which is the signal of good learning) rather than Q-variance (which is the signal of noise).
+                                                                                                                                                                                                                  
+  The corrected formulation should be:                                                                                                                                                                            
+   
+  alpha_correct(s,i,t) = alpha_factor / max(DeltaQ(s,i,t), epsilon)                                                                                                                                               
+                                                                                                                                                                                                                  
+  or, better, a constraint-based adaptation (SAC-style): adapt alpha to maintain a target entropy H_target = log|A_i|/2.                                                                                          
+                                                                                                                                                                                                                  
+  ---                                                                                                                                                                                                             
+  Problem 2 (CRITICAL): V_soft is Not SAC's Principled Soft Value — Missing Entropy Term
+                                                                                                                                                                                                                  
+  CASVD computes:
+                                                                                                                                                                                                                  
+  V_soft(s,i) = Σ_a  π_soft(a|s,i) * Q_target(s,i,a)
+              = E_{π_soft}[Q_target]                                                                                                                                                                              
+   
+  In principled maximum-entropy RL (SAC, soft Q-learning), the soft Bellman consistency equation is:                                                                                                              
+                  
+  V_soft(s) = E_{a ~ π_soft}[Q_soft(s,a)] - α * H(π_soft)                                                                                                                                                         
+             = E_{a ~ π_soft}[Q_soft(s,a)] + α * Σ_a π_soft(a) * log π_soft(a)                                                                                                                                    
+             = α * log Σ_a exp(Q(s,a) / α)     [log-sum-exp form]                                                                                                                                                 
+                                                                                                                                                                                                                  
+  CASVD's version is:                                                                                                                                                                                             
+                                                                                                                                                                                                                  
+  V_soft_casvd = E_{π_soft}[Q_target]   ← no entropy bonus
+               = α * log Σ_a exp(Q/α) - α * H(π_soft) + α * H(π_soft)   ← missing second term                                                                                                                     
+                                                                                                                                                                                                                  
+  The missing term - α * H(π_soft) means CASVD's V_soft is biased downward by exactly:                                                                                                                            
+                                                                                                                                                                                                                  
+  Bias = α * H(π_soft)  =  -α * Σ_a π_soft(a) * log π_soft(a)  ≥ 0                                                                                                                                                
+                                                                                                                                                                                                                  
+  Since H(π_soft) ≥ 0 always, and α > 0, the bias is always non-negative — V_soft is always smaller than the true soft value. The TD targets are systematically pessimistic.                                      
+                                                                                                                                                                                                                  
+  Compounding interaction with Problem 1: Since alpha is inverted (large when Q-spread is large), the bias α * H(π_soft) is LARGEST exactly when the policy is most diffuse (large alpha, high entropy). So the   
+  target underestimation is worst precisely when the agent has the clearest action preference. The mixing network's TD target is most wrong at exactly the states that matter most for learning correct attack
+  behavior.                                                                                                                                                                                                       
+                  
+  This is not equivalent to SAC and doesn't inherit SAC's convergence guarantees.                                                                                                                                 
+  
+  ---                                                                                                                                                                                                             
+  Problem 3 (CRITICAL): Compounding Destruction with Component 1's Tanh
+                                                                       
+  With Q ∈ [-2, +2] (from tanh squashing in Component 1), the Q-spread signal is severely degraded:
+                                                                                                                                                                                                                  
+  - In late training, when the agent has learned action preferences, Q_raw grows. Tanh maps all high-Q-raw actions to ≈ +2.0 and all low-Q-raw actions to ≈ -2.0.                                                 
+  - The result: Q_max ≈ 2.0, Q_mean ≈ weighted avg near 2.0 for top actions                                                                                                                                       
+  - DeltaQ = 2.0 - Q_mean collapses toward a small constant as learning converges                                                                                                                                 
+                                                                                                                                                                                                                  
+  The feedback loop breaks down:                                                                                                                                                                                  
+                                                                                                                                                                                                                  
+  Good learning happens → Q_raw grows → tanh saturates everything to ±2                                                                                                                                           
+  → DeltaQ collapses to small constant                                                                                                                                                                            
+  → alpha = factor * small constant → near-fixed, small alpha
+  → near-deterministic policy regardless of actual Q_raw differences                                                                                                                                              
+  → DeltaQ signal now carries no information about learning state                                                                                                                                                 
+                                                                                                                                                                                                                  
+  The adaptive temperature mechanism becomes a constant after sufficient training — the scale-adaptive property is destroyed by Component 1's bounded range. The two components are mutually self-defeating: tanh 
+  removes the Q-spread variation that Component 2 requires to function, and Component 2's wrong temperature direction compounds the damage from tanh saturation.                                                  
+                                                                                                                                                                                                                  
+  ---             
+  Problem 4 (CRITICAL): alpha_floor = 0.005 Causes Numerical Catastrophe in Float32
+                                                                                                                                                                                                                  
+  When DeltaQ → 0 (actions nearly equal), the floor kicks in:
+                                                                                                                                                                                                                  
+  alpha = 0.005   
+  Q_i / alpha = Q_i / 0.005                                                                                                                                                                                       
+                  
+  With Q ∈ [-2, +2] from tanh:                                                                                                                                                                                    
+  
+  exp(2.0 / 0.005)  = exp(400)  → ∞ in float32 (overflow at exp(88))                                                                                                                                              
+  exp(-2.0 / 0.005) = exp(-400) → 0 underflow                                                                                                                                                                     
+  
+  Float32 overflows at exp(88.7). exp(400) is NaN in float32. The softmax numerator becomes NaN, pi_soft becomes NaN, V_soft becomes NaN, Q_total_target becomes NaN, and the entire loss is undefined.           
+                  
+  You avoid this only if Q-values are perfectly equal (all actions map to same tanh output), which essentially never happens. In practice, whenever DeltaQ < 0.044 (i.e., Q_range / alpha_floor < 88.7 →          
+  2/alpha_floor < 88.7 → alpha_floor > 0.022), you're in overflow territory.
+                                                                                                                                                                                                                  
+  Fix: alpha_floor must satisfy Q_range / alpha_floor < 80 for float32 safety. With Q ∈ [-2, +2], Q_range = 4, requiring alpha_floor > 0.05 minimum. The current 0.005 is 10× too small.                          
+  
+  With unbounded Q (correct linear head), Q_range could reach 30+ in late training, requiring alpha_floor > 0.375. The floor needs to scale with the Q-value range, not be a fixed constant.                      
+                  
+  ---                                                                                                                                                                                                             
+  Problem 5 (SIGNIFICANT): Q_mean Computed Over Variable Available-Action Counts
+                                                                                                                                                                                                                  
+  Q_mean(s,i) = Σ_{avail=1} Q_online(s,i,a) / |{a: avail=1}|
+                                                                                                                                                                                                                  
+  In SMACv2, |{a: avail=1}| varies dramatically:                                                                                                                                                                  
+                                                                                                                                                                                                                  
+  ┌───────────────────────────┬──────────────────────────┬───────┐                                                                                                                                                
+  │         Situation         │    Available actions     │ Count │
+  ├───────────────────────────┼──────────────────────────┼───────┤                                                                                                                                                
+  │ Agent at open center      │ stop + 4 move + 5 attack │ 10    │
+  ├───────────────────────────┼──────────────────────────┼───────┤
+  │ Agent at wall, 1 enemy    │ stop + 2 move + 1 attack │ 4     │                                                                                                                                                
+  ├───────────────────────────┼──────────────────────────┼───────┤                                                                                                                                                
+  │ Agent at wall, no enemies │ stop + 2 move            │ 3     │                                                                                                                                                
+  └───────────────────────────┴──────────────────────────┴───────┘                                                                                                                                                
+                  
+  With Q(stop) ≈ Q(move) << Q(attack):                                                                                                                                                                            
+                  
+  Agent 1 (10 actions): Q_mean ≈ (2.0 + 9 * 0.1) / 10 = 0.29, DeltaQ = 2.0 - 0.29 = 1.71
+  Agent 2 (4 actions):  Q_mean ≈ (2.0 + 3 * 0.1) / 4  = 0.58, DeltaQ = 2.0 - 0.58 = 1.42                                                                                                                          
+  Agent 3 (3 actions):  Q_mean ≈ (0.1 + 0.1 + 0.1) / 3 = 0.1, DeltaQ = 0.1  - 0.1  = 0.0
+                                                                                                                                                                                                                  
+  Agent 1 (most capable, most options) gets the largest alpha (most diffuse policy) simply because it has more available actions diluting the mean — not because it's more uncertain. Agent 3 with no enemies in  
+  range gets DeltaQ ≈ 0, alpha hits the floor, and behaves as near-deterministic. This is precisely backwards in SMACv2: agents with more tactical options need MORE exploration, not less.                       
+                                                                                                                                                                                                                  
+  The temperature is a function of action count, not true uncertainty. This creates systematic per-agent temperature bias uncorrelated with the actual learning signal.                                           
+  
+  ---                                                                                                                                                                                                             
+  Problem 6 (SIGNIFICANT): Stop Action Always in Q_mean — Artificially Depresses Mean in Combat
+                                                                                                                                                                                                                  
+  Stop (action 1) is always available for alive agents. During active combat in SMACv2, Q(stop) ≈ Q(move) << Q(attack). Including stop in Q_mean drags the mean downward, artificially inflating DeltaQ. This is
+  most harmful when:                                                                                                                                                                                              
+                  
+  - Enemies are clustered in range (multiple high-Q attack actions)                                                                                                                                               
+  - Agent is in an open area (all 4 move actions available, all low-Q)
+  - Stop is available (low-Q)                                                                                                                                                                                     
+                                                                                                                                                                                                                  
+  All low-Q non-attack actions inflate |A_avail| and depress Q_mean, inflating DeltaQ, inflating alpha — making the policy MOST diffuse at exactly the moment (enemies in range, attack is clearly optimal) when  
+  it should be MOST concentrated.                                                                                                                                                                                 
+                                                                                                                                                                                                                  
+  Numerically: In a 5v5 scenario with all 5 enemies in range, |A_avail| = 1 (stop) + 4 (move) + 5 (attack) = 10 actions. With Q(attack best) = 1.8, Q(others) ≈ 0: Q_mean ≈ 0.18, DeltaQ ≈ 1.62 → large alpha →   
+  soft policy. Compare with no enemies visible: |A_avail| = 1 + 4 = 5, Q all near 0: DeltaQ ≈ 0.001 → small alpha → sharp policy. The temperature ordering is exactly wrong relative to when sharpness matters.
+                                                                                                                                                                                                                  
+  ---             
+  Problem 7 (SIGNIFICANT): Q_online/Q_target Divergence Invalidates Temperature Calibration
+
+  The temperature alpha is computed from Q_online spread:
+  DeltaQ = max(Q_online) - mean(Q_online)
+  alpha = factor * DeltaQ                
+                                                                                                                                                                                                                  
+  But V_soft evaluates Q_target:
+  V_soft = Σ_a pi_soft(a; Q_online, alpha) * Q_target(s, a)                                                                                                                                                       
+                                                           
+  During early training (high divergence between Q_online and Q_target), the action ranking under Q_online may differ substantially from Q_target's ranking. The temperature calibrated for Q_online's spread is  
+  applied to weight Q_target values. If Q_online incorrectly ranks action a* first, pi_soft(a*) is high, but Q_target(a*) may be near zero (target hasn't converged there yet). V_soft is biased toward the online
+   network's overestimated actions.                                                                                                                                                                               
+                                                                                                                                                                                                                  
+  This is exactly the overestimation bias that Double-Q is supposed to fix — except CASVD's soft Double-Q doesn't fix it because the soft distribution (unlike hard argmax) spreads weight across multiple        
+  actions, including the overestimated one. The bias is:
+                                                                                                                                                                                                                  
+  Bias(V_soft) = Σ_a [pi_soft(a; Q_online) - pi_soft(a; Q_target)] * Q_target(a)
+                                                                                                                                                                                                                  
+  This is zero only when Q_online and Q_target have the same action ranking, which is false during early training. The bias is largest at the beginning of training when you need the most accurate targets.      
+                                                                                                                                                                                                                  
+  ---                                                                                                                                                                                                             
+  Problem 8 (MODERATE): Scale-Invariance Proof is Incomplete — TD Target is Not Scale-Invariant
+                                                                                                                                                                                                                  
+  The proof shows pi_soft is invariant under Q-scaling. But the TD-lambda target:
+                                                                                                                                                                                                                  
+  G_t = r_t + γ * (1-d_t) * [λ * G_{t+1} + (1-λ) * Q_total_target_{t+1}]
+                                                                                                                                                                                                                  
+  contains r_t — the environment reward — which is NOT scaled when Q-values are scaled. Under Q → cQ:                                                                                                             
+                                                                                                                                                                                                                  
+  G_t → r_t + γ * (1-d_t) * [λ * c*G_{t+1} + (1-λ) * c*Q_total_target]                                                                                                                                            
+      ≠ c * G_t  (because r_t is not multiplied by c)                                                                                                                                                             
+                                                                                                                                                                                                                  
+  The claimed scale-invariance holds only for the soft policy pi_soft in isolation. The actual training objective (TD error between Q_online and G_t) is not scale-invariant. Across different SMACv2 maps with   
+  different n_agents and n_enemies (which change the reward scale), the algorithm will behave differently — contrary to the claim.                                                                                
+                                                                                                                                                                                                                  
+  ---             
+  Combined Failure Mode in SMACv2 Battle Dynamics
+                                                                                                                                                                                                                  
+  Put all problems together against a concrete SMACv2 scenario — 10v10 Protoss, enemies in shoot range, late episode (7 dead enemies remain):
+                                                                                                                                                                                                                  
+  1. Tanh (C1): Q_raw for "attack enemy 3" is large, tanh clips to ≈ 2.0. All high-value attack actions cluster near 2.0.                                                                                         
+  2. DeltaQ collapses (C1+C2 interaction): Q_max ≈ 2.0, Q_mean ≈ 1.6 (many actions near 2), DeltaQ ≈ 0.4.                                                                                                         
+  3. Inverted temperature (P1): alpha = factor × 0.4 (moderate). But this is the exact situation needing alpha → 0 (focused fire).                                                                                
+  4. Missing entropy (P2): V_soft underestimates by α × H(π) — in the remaining 3-enemy-in-range situation, this is material.                                                                                     
+  5. Stop in mean (P6): Stop dilutes mean downward, inflating DeltaQ slightly, inflating alpha more.                                                                                                              
+  6. Result: pi_soft ≈ uniform over the 7 remaining enemies in range and stop/move actions. The agent attacks randomly instead of focusing the weakest enemy (kiting), which is the QMIX-optimal strategy.        
+                                                                                                                                                                                                                  
+  QMIX with standard hard-max target: focuses cleanly on the lowest-health enemy in range (clear Q-signal, no temperature distortion), kills faster, wins earlier.                                                
+                                                                                                                                                                                                                  
+  ---                                                                                                                                                                                                             
+  Summary         
+
+  ┌──────────────────────────────────────────────────────────┬──────────────┬──────────────────────────────────────────────────────────────┐
+  │                         Problem                          │   Severity   │                         Core damage                          │
+  ├──────────────────────────────────────────────────────────┼──────────────┼──────────────────────────────────────────────────────────────┤
+  │ Temperature inverted: alpha ∝ DeltaQ instead of 1/DeltaQ │ Catastrophic │ Diffuse policy when action is clear, sharp when confused     │
+  ├──────────────────────────────────────────────────────────┼──────────────┼──────────────────────────────────────────────────────────────┤
+  │ Missing entropy term in V_soft                           │ Critical     │ Systematic underestimation of state values, wrong Bellman eq │                                                                      
+  ├──────────────────────────────────────────────────────────┼──────────────┼──────────────────────────────────────────────────────────────┤                                                                      
+  │ Tanh (C1) collapses DeltaQ signal                        │ Critical     │ Adaptive temperature becomes near-constant noise             │                                                                      
+  ├──────────────────────────────────────────────────────────┼──────────────┼──────────────────────────────────────────────────────────────┤                                                                      
+  │ alpha_floor = 0.005 causes float32 NaN                   │ Critical     │ Training crashes when DeltaQ near zero                       │
+  ├──────────────────────────────────────────────────────────┼──────────────┼──────────────────────────────────────────────────────────────┤                                                                      
+  │ Variable                                                 │ A_avail      │ biases Q_mean                                                │
+  ├──────────────────────────────────────────────────────────┼──────────────┼──────────────────────────────────────────────────────────────┤                                                                      
+  │ Stop action depresses Q_mean in combat                   │ Significant  │ Highest alpha exactly when focused attack needed             │
+  ├──────────────────────────────────────────────────────────┼──────────────┼──────────────────────────────────────────────────────────────┤                                                                      
+  │ Online/target divergence in temperature                  │ Significant  │ Early-training target bias, Double-Q correction insufficient │
+  ├──────────────────────────────────────────────────────────┼──────────────┼──────────────────────────────────────────────────────────────┤                                                                      
+  │ Scale-invariance claim is false                          │ Moderate     │ Behavior varies across maps despite the claim                │
+  └──────────────────────────────────────────────────────────┴──────────────┴──────────────────────────────────────────────────────────────┘                                                                      
+                  

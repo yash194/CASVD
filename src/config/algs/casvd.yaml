@@ -1,0 +1,107 @@
+# ─── CASVD: Coordination-Aware Soft Value Decomposition ───
+
+# ── Action selection for rollout ──────────────────────────────
+action_selector: "epsilon_greedy"
+epsilon_start: 1.0
+epsilon_finish: 0.05
+epsilon_anneal_time: 100000
+
+# Runner
+runner: "parallel"
+batch_size_run: 8
+
+# Replay buffer
+buffer_size: 5000
+batch_size: 128
+
+# Target updates (hard copy every 200 episodes)
+target_update_interval_or_tau: 200
+
+# Observations
+obs_agent_id: True
+obs_last_action: True
+obs_individual_obs: True
+
+# Controller and agent
+mac: "casvd_mac"
+agent: "gat_ns"
+agent_output_type: "q"
+learner: "casvd_learner"
+
+# Mixer
+mixer: "qmix"
+mixing_embed_dim: 32
+hypernet_embed: 64
+
+# Optimizer
+lr: 0.001
+optimizer: "adam"
+optimizer_epsilon: 0.0000001
+
+# GAT encoder
+hidden_dim: 128
+n_heads: 4
+use_rnn: True
+use_layer_norm: True
+use_orthogonal: True
+encoder_gain: 1.0
+q_head_gain: 0.1
+
+# TD learning
+gamma: 0.99
+td_lambda: 0.6
+
+# Gradient clipping
+grad_norm_clip: 10
+
+# Reward
+standardise_returns: False
+standardise_rewards: False
+
+# ── Q-spread-relative soft values ────────────────────────────
+# α_i(s,t) = max(alpha_factor_i × ΔQ_i, alpha_floor)
+#   where ΔQ_i = max(Q_i) - mean(Q_i)  (per-agent Q-spread)
+# Scale-invariant: softmax shape constant in ΔQ units.
+# Self-stabilizing: Q suppression → smaller ΔQ → smaller α → less suppression.
+# V_soft = E_π[Q_target] (no entropy bonus — it causes target inflation in QMIX).
+# With alpha_factor_max=0.3: logit_diff = 1/0.15 ≈ 6.7 → 99% on best action
+# → V_soft ≈ V_hard, eliminating underestimation tax vs QMIX.
+use_soft_values: True
+alpha_factor_init: 0.3        # initial alpha_factor (used on first step before InfoNCE runs)
+alpha_factor_min: 0.0         # hard-max when coordination is perfect
+alpha_factor_max: 0.3         # with Q-spread relative: effective alpha ≈ 0.007 (near hard-max)
+alpha_floor: 0.005            # minimum alpha when q_spread × factor is tiny
+soft_value_warmup_steps: 0
+
+# ── InfoNCE coordination sensor ──────────────────────────────
+# Uses GRU hidden states (not local_summary) for per-agent differentiation:
+# hidden states encode action-observation history, naturally distinct per agent.
+# Agent i predicts mean of OTHER agents' hidden states at t+1 (g_others_i).
+# Per-agent signal: high InfoNCE loss = poor coordination.
+# Gradient-isolated: hidden states are DETACHED before predictor.
+lgdd_enabled: True
+lgdd_lr: 0.0003
+infonce_n_negatives: 15       # K negative samples per positive
+infonce_temperature: 0.1      # softmax temperature τ
+
+# ── Per-agent adaptive alpha_factor ──────────────────────────
+# alpha_factor_i = α_min + (α_max - α_min) × coord_signal_i
+# coord_signal_i = InfoNCE_loss_i / log(K+1), normalized to [0, 1]
+# High InfoNCE loss (poor coordination) → larger alpha_factor → softer targets
+# Low InfoNCE loss (good coordination) → smaller alpha_factor → near hard-max
+use_adaptive_alpha: True
+coord_signal_ema_tau: 0.999    # smooth EMA — proven stable in runs 15-16
+
+# ── Continual learning ────────────────────────────────────────
+cl_enabled: False
+cl_memory_buffer_size: 10000
+cl_current_ratio: 0.8
+cl_min_memory_episodes: 128
+cl_teacher_ema_tau: 0.002
+cl_distill_weight: 0.05
+cl_temperature: 0.1
+
+# Disable features not needed
+store_agent_types: False
+
+name: "casvd"

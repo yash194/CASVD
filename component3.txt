@@ -1,0 +1,423 @@
+Critical Analysis — Component 3: InfoNCE Coordination Sensor
+                                                        
+  ---                                                                                                                                                                                                             
+  Problem 1 (CATASTROPHIC): Negatives Sampled from the Same Episode — The Contrastive Task is Trivial                                                                                                             
+                                                                                                                                                                                                                  
+  g_neg_k = mean_agents(local_summary[neg_idx_k])                                                                                                                                                                 
+  # neg_idx_k sampled from {0,...,T-1} \ {t+1}  ← SAME episode                                                                                                                                                    
+                                                                                                                                                                                                                  
+  InfoNCE's validity as a mutual information lower bound requires negatives drawn i.i.d. from the marginal distribution q(g). The bound is:                                                                       
+                                                                                                                                                                                                                  
+  I(h_i; g_pos) ≥ log(K+1) - L_InfoNCE                                                                                                                                                                            
+                  
+  This is tight only when negatives represent truly independent samples. When negatives come from different timesteps of the same episode, they share the same battle instance: same agents, same starting        
+  positions, same team composition (SMACv2 resets on episode boundaries). The temporal correlation between any two timesteps in the same episode is high — the battle evolves continuously, Q-values are
+  slowly-varying, and the embedding space tracks the game state smoothly.                                                                                                                                         
+                  
+  Consequence: The contrastive task reduces from "distinguish the true future from random alternative futures" to "distinguish t+1 from other timesteps in the same battle." A predictor can trivially do this by 
+  learning the temporal ordering of the game — encoding features that monotonically change over time (number of dead units, elapsed time, cumulative damage dealt). None of these features have anything to do
+  with coordination.                                                                                                                                                                                              
+                  
+  Empirical prediction: The InfoNCE loss will collapse to near-zero within the first 10–50 training episodes purely by learning temporal monotone features. The coord_signal would then report all agents as      
+  "well-coordinated" regardless of their actual behavior, from the very beginning of training.
+                                                                                                                                                                                                                  
+  What should be done: Negatives must be sampled from different episodes, or better, different rollouts entirely. In standard contrastive frameworks (MoCo, SimCLR, BYOL), negatives are always from different    
+  data points precisely to avoid this temporal collapse.
+                                                                                                                                                                                                                  
+  ---             
+  Problem 2 (CATASTROPHIC): g_pos Includes h_i Itself — The Task is Partially Self-Prediction
+                                                                                                                                                                                                                  
+  g_pos(t+1) = (1/n) * Σ_i  local_summary_i(t+1)
+                                                                                                                                                                                                                  
+  Agent i's positive target includes its own embedding at t+1 as one of the n terms in the mean. The InfoNCE predictor is asked:                                                                                  
+                                                                                                                                                                                                                  
+  "Can W * h_i(t) predict mean_j(h_j(t+1)) including h_i(t+1)?"                                                                                                                                                   
+                                                                                                                                                                                                                  
+  In SMACv2 with step_mul=8 (8 game frames per agent step), the game state barely changes between t and t+1 for most agents. Specifically:                                                                        
+                                                                                                                                                                                                                  
+  h_i(t+1) ≈ h_i(t) + δ_i,   ||δ_i|| << ||h_i(t)||                                                                                                                                                                
+                                                                                                                                                                                                                  
+  Therefore:                                                                                                                                                                                                      
+  g_pos(t+1) = (1/n) * h_i(t+1) + (1/n) * Σ_{j≠i} h_j(t+1)                                                                                                                                                        
+             ≈ (1/n) * h_i(t)   + slowly-varying team term
+                                                                                                                                                                                                                  
+  The simplest solution the predictor W can learn: W ≈ (1/n) * I — scale the identity. This makes h_proj ≈ (1/n) h_i(t), which aligns with the (1/n) contribution of h_i(t+1) ≈ h_i(t) in g_pos. The InfoNCE loss 
+  collapses by self-correlation, not team coordination.                                                                                                                                                           
+                                                                                                                                                                                                                  
+  An agent sitting stationary in a corner (terrible MARL behavior) has h_i(t) ≈ h_i(t+1) → perfect self-prediction → coord_signal → 0 → labeled "well-coordinated." An agent actively repositioning and changing  
+  targets (good MARL behavior) has h_i(t+1) ≠ h_i(t) → slightly harder prediction → higher InfoNCE → labeled "poorly-coordinated."
+                                                                                                                                                                                                                  
+  The sensor rewards inactivity.                                                                                                                                                                                  
+  
+  ---                                                                                                                                                                                                             
+  Problem 3 (CRITICAL): g(t) = mean_i(local_summary_i(t)) Is Not the Global State — Measures Observation Overlap, Not Coordination
+                                                                                                                                                                                                                  
+  The true global state in SMACv2 is get_state():
+                                                                                                                                                                                                                  
+  state = [all ally health, cooldowns, absolute positions, shields,
+           all enemy health, absolute positions, shields,                                                                                                                                                         
+           last actions, timestep]                                                                                                                                                                                
+                                                                                                                                                                                                                  
+  This is omniscient — no partial observability. What CASVD calls "global team state" is:                                                                                                                         
+                  
+  g(t) = mean_i(encoder(obs_i(t)))                                                                                                                                                                                
+                  
+  where obs_i(t) is agent i's partial, local, sight-range-limited observation. This mean has a critical property: it reflects only what the team collectively observes, not the true world state.                 
+  
+  Direct failure mode in SMACv2: Consider two tactical configurations:                                                                                                                                            
+                  
+  ┌─────────────────────────────────────────┬─────────────────────────────────────────────────┬─────────────────────────────────────────────────────────┬─────────────────────────────────────────┐               
+  │              Configuration              │                   Description                   │                          g(t)                           │           InfoNCE difficulty            │
+  ├─────────────────────────────────────────┼─────────────────────────────────────────────────┼─────────────────────────────────────────────────────────┼─────────────────────────────────────────┤               
+  │ Clustered (suboptimal)                  │ All agents in one ball, see same enemies        │ All h_i similar → g ≈ h_i → trivially predictable       │ Low loss → coord ≈ 0 ("coordinated")    │
+  ├─────────────────────────────────────────┼─────────────────────────────────────────────────┼─────────────────────────────────────────────────────────┼─────────────────────────────────────────┤
+  │ Flanking (optimal for many SMACv2 maps) │ Agents on opposite sides, see different enemies │ All h_i differ → g is a noisy mixture → hard to predict │ High loss → coord ≈ 1 ("uncoordinated") │               
+  └─────────────────────────────────────────┴─────────────────────────────────────────────────┴─────────────────────────────────────────────────────────┴─────────────────────────────────────────┘               
+                                                                                                                                                                                                                  
+  The sensor penalizes the superior tactical formation and rewards the inferior one. In protoss 10v10 and zerg maps where flanking and focus-fire from multiple angles is optimal, the coordination signal        
+  systematically mislabels good agents as poorly coordinated.
+                                                                                                                                                                                                                  
+  ---             
+  Problem 4 (CRITICAL): Gradient Isolation Prevents the Sensor From Measuring What It Claims
+                                                                                                                                                                                                                  
+  The gradient isolation ensures InfoNCE only trains W, never the encoder:
+                                                                                                                                                                                                                  
+  Pass 1: infonce_loss.backward() → updates only W
+  Pass 2: td_loss.backward()      → updates encoder                                                                                                                                                               
+                  
+  The stated reason: "prevent competing gradients between InfoNCE and TD objectives." But this has a fatal consequence:                                                                                           
+                  
+  The encoder's local_summary is shaped exclusively by the TD loss. The TD loss optimizes for Q-value accuracy — features useful for predicting action values. These features are not the same as features useful 
+  for predicting the global team future. For example:
+                                                                                                                                                                                                                  
+  - TD-optimal feature: "enemy 3 has 20% health and is in range" → high Q for attacking enemy 3                                                                                                                   
+  - Coordination-predictive feature: "the centroid of all agents is moving northeast and will converge at position (18, 22) at t+5"
+                                                                                                                                                                                                                  
+  The encoder never learns the second type because the TD loss doesn't reward it. W (the linear projection) can only rotate/scale features that exist in the local_summary. If the encoder doesn't represent team 
+  trajectory information (and it has no reason to, being purely TD-driven), then:                                                                                                                                 
+                                                                                                                                                                                                                  
+  W * h_i(t)  cannot predict g_pos(t+1)
+                                                                                                                                                                                                                  
+  regardless of actual coordination quality. All agents will have uniformly high InfoNCE loss — all labelled "uncoordinated" — not because they fail to coordinate, but because the encoder simply doesn't encode 
+  the information W needs. The sensor reports failure of representational alignment, not failure of coordination.                                                                                                 
+                                                                                                                                                                                                                  
+  The InfoNCE would only be meaningful if the encoder were jointly trained to be predictive (which would require letting InfoNCE gradients flow into the encoder). By isolating gradients, the sensor is observing
+   representations that were never asked to encode what the sensor measures. It's running a chemistry test on a biology sample.
+                                                                                                                                                                                                                  
+  ---             
+  Problem 5 (CRITICAL): EMA τ = 0.999 Means the Coordination Signal is Effectively Frozen During Training
+                                                                                                                                                                                                                  
+  coord_signals = 0.999 * coord_signals_old + 0.001 * coord_signal_batch
+                                                                                                                                                                                                                  
+  Time constant: 1 / (1 - 0.999) = 1000 training batches.                                                                                                                                                         
+                                                                                                                                                                                                                  
+  With standard PyMARL2 training (batch_size=32 episodes, episode_limit=200):                                                                                                                                     
+  - One training step processes 32 episodes
+  - 1000 training batches = 32,000 episodes = 6.4M environment steps (for 200-step episodes)                                                                                                                      
+                                                                                            
+  Standard SMACv2 benchmarks run for 2M–10M environment steps. The coordination signal's effective update window is comparable to or larger than the entire training horizon. Any real change in agent            
+  coordination (due to improved policies) takes the entire training run to appear in coord_signal.                                                                                                                
+                                                                                                                                                                                                                  
+  Practical consequence: coord_signal_i is initialized near 1.0 (random predictor → near-random InfoNCE → loss ≈ log(16)). Over the 2M-step training run, it slowly drifts. By the end of training, it has moved  
+  perhaps:        
+                                                                                                                                                                                                                  
+  After 2M steps at 32 eps/batch, 200 steps/eps:
+  n_batches = 2M / (32 * 200) ≈ 312 batches                                                                                                                                                                       
+  drift = 1 - 0.999^312 = 1 - 0.73 = 0.27 of the way to coord_signal_batch                                                                                                                                        
+                                                                                                                                                                                                                  
+  coord_signal never reaches its steady-state value during training. The alpha_factor it drives (in Component 2) is essentially the same value throughout training — a fixed per-agent constant. The "per-agent   
+  adaptive temperature" from Component 2 is not adaptive at all.                                                                                                                                                  
+                                                                                                                                                                                                                  
+  Fix: τ ∈ [0.95, 0.99] (time constant of 20–100 batches). Even 0.99 takes 300 batches ≈ 1.9M steps to stabilize — still too slow. For SMACv2, τ ≤ 0.97 (time constant ≤ 33 batches) is necessary to be responsive
+   within the training horizon.
+                                                                                                                                                                                                                  
+  ---             
+  Problem 6 (SIGNIFICANT): Temperature τ = 0.1 Causes Rapid InfoNCE Collapse in High-D Embedding Space
+                                                                                                                                                                                                                  
+  With L2-normalized embeddings in R^128, random unit vectors have expected cosine similarity:
+                                                                                                                                                                                                                  
+  E[cos(u, v)] = 0  (symmetric distribution)
+  Std[cos(u, v)] ≈ 1/sqrt(128) ≈ 0.088                                                                                                                                                                            
+                                                                                                                                                                                                                  
+  The InfoNCE score at temperature τ = 0.1:                                                                                                                                                                       
+                                                                                                                                                                                                                  
+  score = cos(h_proj_n, g_n) / 0.1 = 10 * cos(h_proj_n, g_n)                                                                                                                                                      
+                                                                                                                                                                                                                  
+  For random embeddings:
+  - Positive (t+1, correlated): cos ≈ 0.3–0.6 (same episode, similar state) → score = 3–6                                                                                                                         
+  - Negatives (other timesteps, same episode): cos ≈ 0.1–0.3 → score = 1–3                                                                                                                                        
+  
+  The gap between positive and negative scores is amplified 10× by τ =                                                                                                                                            
+                  
+⏺ Critical Analysis — Component 3: InfoNCE Coordination Sensor                                                                                                                                                    
+                                                        
+  ---
+  Problem 1 (CATASTROPHIC): The InfoNCE Task Is Solved by Temporal Proximity, Not Coordination                                                                                                                    
+                                                                                                                                                                                                                  
+  The contrastive task:                                                                                                                                                                                           
+                                                                                                                                                                                                                  
+  Positive: g_pos  = mean_i(local_summary_i(t+1))   ← team state at next step
+  Negatives: g_neg_k = mean_i(local_summary_i(neg_t)) ← team state at random timestep                                                                                                                             
+                                                                                                                                                                                                                  
+  In SMACv2, consecutive timesteps are maximally autocorrelated. Between t and t+1:                                                                                                                               
+  - Agents move _move_amount = 2 game units per step                                                                                                                                                              
+  - Health changes by a few HP (one weapon fire cycle)                                                                                                                                                            
+  - The map is identical                              
+  - No units teleport or spawn                                                                                                                                                                                    
+                              
+  The embedding local_summary(t+1) is extremely similar to local_summary(t). Meanwhile, negatives from early episode (t=5) vs late episode (t=150) are very different — health is lower, dead agents are absent   
+  (zero embedding), positions are changed.                                                                                                                                                                        
+  
+  A trivially simple predictor W can solve this task by learning the near-identity map: "predict that g(t+1) ≈ g(t) ≈ h_i(t)." The positive always wins not because agent i is coordinated, but because t+1 is    
+  always close to t in SMACv2's dynamics.
+                                                                                                                                                                                                                  
+  Quantify: With step_mul = 8 game steps per environment step, movement = 2 units, map size = 32×32:                                                                                                              
+  
+  Positional change per step: 2/32 = 6.25% of map length                                                                                                                                                          
+  HP change per step: ~1-5 HP out of 80-300 HP total = ~1-6%                                                                                                                                                      
+                                                                                                                                                                                                                  
+  The embedding change ||g(t+1) - g(t)|| is small. The identity predictor h_proj ≈ h_i → g_pos achieves low InfoNCE loss in expectation, giving:                                                                  
+                                                                                                                                                                                                                  
+  coord_signal_i ≈ 0   for ALL agents                                                                                                                                                                             
+                                                                                                                                                                                                                  
+  regardless of how coordinated they actually are. The sensor measures temporal autocorrelation of the embedding space, which is a property of the environment dynamics (slow movement, gradual health depletion),
+   not agent coordination.                                                                                                                                                                                        
+                                                                                                                                                                                                                  
+  ---             
+  Problem 2 (CATASTROPHIC): The "Global Team State" g(t+1) Is Not the Global State
+                                                                                                                                                                                                                  
+  g(t+1) = (1/n) * Σ_i  local_summary_i(t+1)
+                                                                                                                                                                                                                  
+  This is the mean of locally-derived embeddings, not the true global state s(t+1) that the QMIX mixer uses. Each local_summary_i(t+1) is derived from agent i's partial observation o_i(t+1). In SMACv2:         
+                                                                                                                                                                                                                  
+  o_i(t+1) = [move_feats | visible_enemies | visible_allies | own_feats]                                                                                                                                          
+                                                                                                                                                                                                                  
+  Agent i can only observe entities within sight range (9 game units default). Agent j on the opposite side of the map is invisible to i. Yet g(t+1) = mean pooling includes j's embedding. The InfoNCE task      
+  demands that h_i(t) predict information about j's state at t+1, even though:                                                                                                                                    
+                                                                                                                                                                                                                  
+  1. Agent i cannot observe j at t                                                                                                                                                                                
+  2. Agent i cannot observe j at t+1
+  3. There is no causal path from i's observation to j's future state                                                                                                                                             
+                                                                                                                                                                                                                  
+  No amount of coordination enables agent i to predict what agent j observes across the map. The InfoNCE signal will be permanently high for any physically isolated agent, regardless of behavioral coordination.
+   In a 10v10 battle where agents necessarily spread across the 32×32 map, most agents are in partial observability of each other. All of them get labeled "poorly coordinated" due to this information-theoretic 
+  impossibility.                                                                                                                                                                                                  
+                  
+  The task confounds coordination with observational overlap. An agent tightly grouped with 5 teammates has a local embedding that IS the team mean embedding. Low InfoNCE loss — labeled "coordinated." A        
+  flanking agent with an isolated observation — high InfoNCE loss — labeled "uncoordinated." In optimal SMACv2 play, flanking is the correct strategy (surrounding enemies for concentrated fire). Your sensor
+  labels the optimal flanker as uncoordinated and makes its policy more diffuse (via high alpha_factor → Problem 1 in Component 2).                                                                               
+                  
+  ---
+  Problem 3 (CRITICAL): The Target g(t+1) Is Non-Stationary — Moving Target During Training
+                                                                                                                                                                                                                  
+  g(t+1) = mean_i(local_summary_i(t+1))
+                                                                                                                                                                                                                  
+  local_summary_i is the output of the LocalEntityGAT encoder. The encoder parameters θ_enc are updated every training step via the TD loss. Therefore:                                                           
+                                                                                                                                                                                                                  
+  g(t+1; θ_enc^{step s}) ≠ g(t+1; θ_enc^{step s+1})                                                                                                                                                               
+                                                                                                                                                                                                                  
+  The InfoNCE target changes every training step, even for the same trajectory. The predictor W is chasing a target that moves every gradient step. This is a well-known failure mode in self-supervised learning 
+  — when the "label" is derived from a simultaneously-trained encoder, the representation collapse or representation drift prevents stable convergence.                                                           
+                                                                                                                                                                                                                  
+  Concretely:                                                                                                                                                                                                     
+  - At step 0: encoder maps all obs to near-random embeddings. g(t+1) ≈ random. W trains to predict random noise.
+  - At step 1000: encoder has learned some Q-relevant features. g(t+1) changes meaning. W's previous training is now wrong.                                                                                       
+  - At step 10000: encoder has converged somewhat. g(t+1) is more stable. W finally has a stable target.                   
+                                                                                                                                                                                                                  
+  But tau_EMA = 0.999 means coord_signals from step 0 (all-random, all ≈ 1.0) persist for thousands of updates. The coordination signal fed to alpha_factor during the critical early training period is: all     
+  agents appear maximally uncoordinated, because W hasn't learned to predict the moving target yet. Under the inverted temperature from Component 2 (Problem 1), all agents get large alpha, all policies are     
+  diffuse, TD learning gets soft targets — exactly the worst-case configuration during the most data-efficient learning window.                                                                                   
+                                                                                                                                                                                                                  
+  ---             
+  Problem 4 (CRITICAL): Gradient Isolation Makes the Encoder Blind to Coordination
+                                                                                                                                                                                                                  
+  The core architectural decision:
+                                                                                                                                                                                                                  
+  h_i = local_summary.detach()   ← encoder sees NO coordination gradient
+                                                                                                                                                                                                                  
+  The InfoNCE predictor W observes encoder outputs passively. The encoder is trained ONLY on TD loss. The result:
+                                                                                                                                                                                                                  
+  The encoder never develops representations that are useful for InfoNCE. The encoder converges to Q-value-relevant representations, which may or may not correlate with future team states. The predictor W then 
+  measures "how much mutual information do Q-optimal embeddings happen to share with future team means." This is an artifact of the TD learning geometry, not a coordination signal.
+                                                                                                                                                                                                                  
+  Compare with methods that DO allow the coordination signal to shape representations: MAVEN (latent variable shapes agent behavior), RODE (role representations are explicitly shared), QPLEX's attention        
+  (explicitly attends to team states). In all these, the auxiliary signal modifies the representation. In CASVD, it doesn't. The InfoNCE is a read-only measurement of an encoder it can't influence.
+                                                                                                                                                                                                                  
+  The resulting measurement is: "How predictive are Q-optimal local embeddings of the average Q-optimal local embedding at the next timestep?" This is circular — it measures properties of the encoder's internal
+   geometry, which is shaped by TD dynamics, not coordination.
+                                                                                                                                                                                                                  
+  ---             
+  Problem 5 (CRITICAL): In-Episode Negatives Cause Systematic False Negatives
+
+  neg_idx_k ~ Uniform({0,...,T-1} \ {t+1})
+                                                                                                                                                                                                                  
+  Negatives are sampled from the same episode at different timesteps. In SMACv2, an episode is a single continuous trajectory. The embedding at t=50 and t=51 are both "negatives" for t=49's positive (t=50). But
+   t=51 — labeled negative — is MORE similar to the true positive t=50 than t=100 is.                                                                                                                             
+                                                                                                                                                                                                                  
+  False negative problem: t+2, t+3, ... t+10 are all semantically near-identical to the positive t+1 but are labeled as negatives. The contrastive loss penalizes the predictor for scoring t+2 higher than t+1,  
+  even though both are equally valid "coordinated" future states.
+                                                                                                                                                                                                                  
+  The InfoNCE lower bound on mutual information is known to be degraded by false negatives:                                                                                                                       
+  
+  L_InfoNCE (with false negatives) overestimates the true loss                                                                                                                                                    
+  coord_signal is inflated above the true coordination signal                                                                                                                                                     
+                                                                                                                                                                                                                  
+  Agents appear less coordinated than they are because genuinely similar future states are used as negative examples. The correct approach for episodic MARL is to sample negatives from other episodes (different
+   batch elements), ensuring true negatives represent genuinely different team configurations.                                                                                                                    
+                                                                                                                                                                                                                  
+  ---             
+  Problem 6 (CRITICAL): Single Linear W Predicts Across Agents With No Access to Global Information
+                                                                                                                                                                                                                  
+  h_proj = W * h_i    W ∈ R^{128×128}
+  Target: g(t+1) = mean_j(local_summary_j(t+1))                                                                                                                                                                   
+                  
+  Agent i's local embedding h_i contains information about what agent i observes: entities within its sight range. For agent i to predict mean_j(local_summary_j(t+1)), it needs to predict what every other agent
+   j observes at t+1. This is informationally impossible for agents j not in i's sight range.
+                                                                                                                                                                                                                  
+  The linear map W can only extract from h_i the component that linearly correlates with the future team mean. For isolated agents, this component is essentially zero (no shared information). A linear map of   
+  dimension 128×128 has 16,384 parameters. But the relevant subspace — "what part of h_i predicts the unobserved parts of g(t+1)" — has measure zero because h_i by construction CANNOT contain information about
+  unobserved agents.                                                                                                                                                                                              
+                  
+  W therefore learns to predict only the SELF-CONTRIBUTION to g(t+1):                                                                                                                                             
+  
+  g(t+1) = (1/n) * [local_summary_i(t+1) + Σ_{j≠i} local_summary_j(t+1)]                                                                                                                                          
+                                                                                                                                                                                                                  
+  W can predict the first term (agent i's own future state, which is predictable from its current state). It cannot predict the second term. The InfoNCE loss converges to measuring: "How much does agent i's    
+  self-state change from t to t+1?" — which is entirely a function of environmental dynamics (did it get hit, did it move) and NOT behavioral coordination.                                                       
+                                                                                                                                                                                                                  
+  ---             
+  Problem 7 (SIGNIFICANT): EMA tau=0.999 Creates a Dead Signal for the Entire Training Run
+                                                                                                                                                                                                                  
+  coord_signals = 0.999 * coord_old + 0.001 * coord_new
+                                                                                                                                                                                                                  
+  The EMA window length: 1/(1-0.999) = 1000 gradient updates.                                                                                                                                                     
+                                                                                                                                                                                                                  
+  In PyMARL2 training with SMACv2:                                                                                                                                                                                
+  - Batch size: typically 32 episodes × episode length
+  - Updates per 1M env steps: depends on update frequency, typically ~50K-100K gradient steps for 1M env steps                                                                                                    
+                                                                                                              
+  The EMA needs 1000 gradient updates to converge to the actual signal. During those 1000 updates, alpha_factor is driven by:                                                                                     
+                                                                                                                                                                                                                  
+  Initial coord_signal ≈ 1.0 for all agents   (encoder is random, InfoNCE ~ log(K+1))                                                                                                                             
+                                                                                                                                                                                                                  
+  This means for the first ~1000 gradient steps (~10K-100K environment steps), all agents have coord_signal ≈ 1.0, alpha_factor is high, alpha is large, soft targets are maximally diffuse. This is the exact    
+  period where QMIX makes its fastest progress (reward signal is most informative at initialization). Your algorithm is maximally suppressing Q-value learning exactly during the most productive learning window.
+                                                                                                                                                                                                                  
+  After 1000 gradient steps, the encoder has already converged substantially in simpler QMIX. CASVD's coordination signal only starts being meaningful after QMIX has already established a reasonable policy.    
+  
+  ---                                                                                                                                                                                                             
+  Problem 8 (SIGNIFICANT): The Coordination Signal Is Downstream of Both C1 and C2 Failures
+                                                                                                                                                                                                                  
+  The full chain:
+  C1 (tanh) → collapses Q-value range                                                                                                                                                                             
+    → local_summary embeddings become Q-range-limited
+    → g(t+1) mean embeddings are also Q-range-limited                                                                                                                                                             
+    → DeltaQ collapses (C2 interaction)                                                                                                                                                                           
+                                                                                                                                                                                                                  
+  C3 InfoNCE:                                                                                                                                                                                                     
+    → predicts g(t+1) built from tanh-saturated, Q-limited embeddings                                                                                                                                             
+    → coord_signal measures autocorrelation of clipped representations                                                                                                                                            
+    → feeds back to C2's alpha_factor                                                                                                                                                                             
+    → which is already inverted (C2 Problem 1)                                                                                                                                                                    
+                                                                                                                                                                                                                  
+  The coordination signal is built on top of two already-broken components. Even if C3's design were correct, the input embeddings local_summary_i are shaped by C1's tanh saturation — they don't faithfully     
+  encode the Q-value landscape, so the InfoNCE signal measured over them is doubly confounded.                                                                                                                    
+                                                                                                                                                                                                                  
+  ---                                                                                                                                                                                                             
+  Problem 9 (SIGNIFICANT): K=15 Negatives Is Statistically Insufficient
+                                                                       
+  The InfoNCE lower bound on mutual information:
+                                                                                                                                                                                                                  
+  I(h_i; g) ≥ log(K+1) - L_InfoNCE
+                                                                                                                                                                                                                  
+  With K=15: maximum bound = log(16) ≈ 2.77 nats ≈ 4 bits. In 128-dimensional embedding space, the actual mutual information between coordinated agents' representations can be substantially higher. The bound is
+   too loose to distinguish fine-grained coordination differences between agents.
+                                                                                                                                                                                                                  
+  Concretely: with K=15, the resolution of the coord_signal is:                                                                                                                                                   
+  
+  Possible InfoNCE values: [0, log(16)] = [0, 2.77]                                                                                                                                                               
+  After dividing by log(K+1): [0, 1.0]                                                                                                                                                                            
+                                                                                                                                                                                                                  
+  Distinguishable coordination levels: proportional to K = 15                                                                                                                                                     
+                                                                                                                                                                                                                  
+  All agents with "moderately bad" coordination (score 3rd out of 16) are indistinguishable from agents with "very bad" coordination (score last out of 16). The per-agent differentiation needed to correctly    
+  tune alpha_factor per agent requires much finer resolution than 15 bins. MINE (Mutual Information Neural Estimation) or other estimators with batch-wise negatives (K proportional to batch size ~128-512) would
+   provide the necessary resolution.                                                                                                                                                                              
+                  
+  ---
+  Problem 10 (MODERATE): Under Shared Encoder Parameters, All Agents' Embeddings Converge
+                                                                                                                                                                                                                  
+  In PyMARL2's parameter-sharing architecture, all agents use the same encoder weights:
+                                                                                                                                                                                                                  
+  W_self, W_ally, W_enemy, W_Q, W_K, W_V  ← shared across all n_agents
+                                                                                                                                                                                                                  
+  With shared parameters, agents in similar situations produce similar embeddings. As training progresses and the encoder converges:                                                                              
+                                                                                                                                                                                                                  
+  g(t+1) = mean_i(local_summary_i(t+1))                                                                                                                                                                           
+         ≈ local_summary_j(t+1) for any j in a "typical" situation                                                                                                                                                
+                                                                                                                                                                                                                  
+  Predicting g(t+1) from h_i(t) becomes almost trivially easy for all agents — the mean is well-approximated by any individual agent's representation because the shared encoder maps all agents similarly.       
+  InfoNCE loss → 0 for all agents. coord_signal → 0 for all agents. alpha_factor → 0 for all agents.                                                                                                              
+                                                                                                                                                                                                                  
+  The entire CASVD mechanism collapses to standard hard-max QMIX as the encoder converges. The coordination signal degrades to near-zero uniformly, alpha → 0, pi_soft → argmax, V_soft → V_hard. All the         
+  complexity of C2 and C3 disappears as training progresses.
+                                                                                                                                                                                                                  
+  This means CASVD is QMIX with extra overhead that disappears at convergence. It only differs from QMIX during the noisy, unstable early training phase — when its broken signals actively harm learning. At     
+  convergence, it becomes QMIX. It cannot surpass QMIX.
+                                                                                                                                                                                                                  
+  ---             
+  Full Failure Chain: How C3 Feeds Back to Destroy C2 and C1
+                                                                                                                                                                                                                  
+  t=0 (random encoder):
+    C3: InfoNCE ≈ log(16) → coord_signal ≈ 1.0 for all agents (EMA starts at 1.0)                                                                                                                                 
+    C2: alpha_factor ≈ 1.0 (from coord_signal=1.0), alpha = alpha_factor * DeltaQ (but inverted)                                                                                                                  
+    C1: Q_raw small (orthogonal init gain=0.1), tanh ≈ linear, DeltaQ ≈ small → alpha ≈ small                                                                                                                     
+        → pi_soft ≈ uniform (floor kicks in), V_soft ≈ Q_mean ≈ 0                                                                                                                                                 
+                                                                                                                                                                                                                  
+  t=5K steps (encoder partially trained):                                                                                                                                                                         
+    C3: coord_signal ≈ 0.995 (barely moved due to tau=0.999)                                                                                                                                                      
+    C1: Q_raw grows, tanh starts saturating → DeltaQ grows but then collapses as tanh saturates                                                                                                                   
+    C2: alpha = alpha_factor * DeltaQ ... but alpha_factor ≈ 1.0 still from stale EMA                                                                                                                             
+        → alpha is large → pi_soft is SOFT → V_soft << V_hard                                                                                                                                                     
+        → targets are pessimistic → agents learn undervalued actions → fewer attacks                                                                                                                              
+                                                                                                                                                                                                                  
+  t=50K steps (encoder largely converged, shared params):                                                                                                                                                         
+    C3: g(t+1) ≈ any local_summary_i(t+1) (shared encoder converged)                                                                                                                                              
+        InfoNCE → 0 → coord_signal → 0 for ALL agents                                                                                                                                                             
+    C2: alpha_factor → 0, alpha → alpha_floor = 0.005 → pi_soft ≈ argmax                                                                                                                                          
+    C1: Q_raw saturated by tanh → DeltaQ ≈ constant                                                                                                                                                               
+    → Effectively becomes QMIX with tanh-degraded Q-values                                                                                                                                                        
+    → But QMIX without tanh has already surpassed this state                                                                                                                                                      
+                                                                                                                                                                                                                  
+  ---                                                                                                                                                                                                             
+  Summary Table                                                                                                                                                                                                   
+                  
+  ┌────────────────────────────────────────────────────────┬──────────────┬────────────────────────────────────────────────┬──────────────────────────────────────────────────────────────────────────────────┐
+  │                        Problem                         │   Severity   │                   Mechanism                    │                                  SMACv2 Impact                                   │   
+  ├────────────────────────────────────────────────────────┼──────────────┼────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────┤
+  │ InfoNCE solved by temporal proximity, not coordination │ Catastrophic │ t+1 always close to t in slow env              │ Signal measures autocorrelation, not coordination                                │   
+  ├────────────────────────────────────────────────────────┼──────────────┼────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────┤
+  │ g(t+1) = mean(local), not true global state            │ Catastrophic │ Isolated agents cannot predict unobserved      │ Flankers labeled uncoordinated → diffuse policies                                │   
+  │                                                        │              │ teammates                                      │                                                                                  │   
+  ├────────────────────────────────────────────────────────┼──────────────┼────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────┤   
+  │ Non-stationary target as encoder trains                │ Critical     │ g(t+1) changes every gradient step             │ W chases moving target; signal stale during productive training                  │   
+  ├────────────────────────────────────────────────────────┼──────────────┼────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────┤
+  │ Gradient isolation prevents coordination-shaped        │ Critical     │ Encoder optimizes TD only, not InfoNCE         │ Signal measures Q-geometry artifacts, not coordination                           │   
+  │ representations                                        │              │                                                │                                                                                  │
+  ├────────────────────────────────────────────────────────┼──────────────┼────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────┤   
+  │ In-episode negatives → false negatives                 │ Critical     │ t+2, t+3 are semantically positive but labeled │ InfoNCE loss inflated; coord_signal overestimates uncoordination                 │
+  │                                                        │              │  negative                                      │                                                                                  │   
+  ├────────────────────────────────────────────────────────┼──────────────┼────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────┤
+  │ Single linear W insufficient for cross-agent           │ Significant  │ Can't predict unobserved teammates' states     │ Degenerates to self-state prediction                                             │   
+  │ prediction                                             │              │                                                │                                                                                  │
+  ├────────────────────────────────────────────────────────┼──────────────┼────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────┤   
+  │ EMA tau=0.999 creates dead signal during productive    │ Significant  │ 1000 updates to respond to changes             │ All agents appear uncoordinated during early training; alpha maximized when it   │
+  │ window                                                 │              │                                                │ should be minimal                                                                │   
+  ├────────────────────────────────────────────────────────┼──────────────┼────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────┤
+  │ K=15 negatives: insufficient resolution                │ Significant  │ Resolution = 15 discrete levels                │ Can't fine-tune per-agent alpha_factor                                           │
+  ├────────────────────────────────────────────────────────┼──────────────┼────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────┤   
+  │ Shared encoder convergence collapses coord_signal      │ Moderate     │ All agents embed similarly → mean predictable  │ CASVD reduces to QMIX at convergence; extra overhead for nothing                 │
+  ├────────────────────────────────────────────────────────┼──────────────┼────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────┤   
+  │ Downstream compound failure into C2's inverted         │ Moderate     │ coord_signal feeds broken alpha_factor         │ Flankers get most diffuse policies; clustered agents get sharpest                │
+  │ temperature                                            │              │                                                │                                                                                  │   
+  └────────────────────────────────────────────────────────┴──────────────┴────────────────────────────────────────────────┴──────────────────────────────────────────────────────────────────────────────────┘
