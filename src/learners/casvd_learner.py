@@ -16,11 +16,17 @@ class CASVDLearner:
     Combines:
     - GAT encoder with parameter sharing (shared Q-head, no tanh squashing)
     - QMIX mixer for value decomposition with monotonicity
-    - Q-spread-relative soft value targets (no entropy bonus):
-        α_i = max(alpha_factor_i × ΔQ_i, alpha_floor)
+    - Inverted-α soft targets (pure expectation, no entropy bonus):
+        α_i = clip(alpha_factor_i / ΔQ_i, alpha_floor, alpha_factor_max)
         V_soft(s,i) = E_{π_soft}[Q_target(s,i,a)]
-      Self-stabilizing: small Q-spread → small α → V_soft ≈ V_hard.
-      Scale-invariant: softmax shape constant regardless of Q-value scale.
+      Large ΔQ (clear winner) → small α → sharp π (exploit).
+      Small ΔQ (uniform Q)    → α saturates at cap → soft π (explore).
+      No entropy bonus in the target: it reproduced run-18 target inflation
+      because per-agent Q is bounded by LayerNorm so the inverted-α
+      self-limiting loop fails to trigger, and the mixer then amplifies the
+      bounded per-agent bonus into unbounded Q_total. Accepts the mild
+      V_soft ≤ V_hard pessimism, which vanishes asymptotically as π_soft
+      sharpens on the learned argmax.
     - Per-agent alpha_factor from coordination signal:
         alpha_factor_i = α_min + (α_max - α_min) × coord_signal_i
         coord_signal_i = 0 → well-coordinated → near hard-max (exploit)
@@ -46,9 +52,9 @@ class CASVDLearner:
         self.mixer = NMixer(args)
         self.target_mixer = copy.deepcopy(self.mixer)
 
-        # ── Q-spread-relative soft value decomposition ──
-        # α_i = max(alpha_factor_i × ΔQ_i, alpha_floor)
-        # V_soft(s,i) = E_{π_soft}[Q_target(s,i,a)]  (no entropy bonus)
+        # ── Inverted-α soft value decomposition (no entropy bonus) ──
+        # α_i = clip(alpha_factor_i / ΔQ_i, alpha_floor, alpha_factor_max)
+        # V_soft(s,i) = E_{π_soft}[Q_target(s,i,a)]
         # alpha_factor_i = alpha_min + (alpha_max - alpha_min) × coord_signal_i
         self.use_soft_values = getattr(args, "use_soft_values", False)
         self.alpha_factor = getattr(args, "alpha_factor_init", 0.5)   # fallback scalar
@@ -56,6 +62,19 @@ class CASVDLearner:
         self.alpha_factor_max = getattr(args, "alpha_factor_max", 0.3)
         self.alpha_floor = getattr(args, "alpha_floor", 0.005)
         self.soft_value_warmup_steps = getattr(args, "soft_value_warmup_steps", 0)
+
+        # q_spread_mode toggles how ΔQ is measured (drives α = factor / ΔQ):
+        #   "gap"  → Q_max − Q_2nd_max over available actions (advantage gap).
+        #            Invariant to kills of non-top-2 actions; semantically
+        #            "confidence margin in the best action".
+        #   "mean" → Q_max − mean(mac_out) over ALL n_actions (unmasked mean).
+        #            Denominator is constant (n_actions) and numerator is
+        #            independent of the avail mask, but includes untrained
+        #            outputs for long-masked slots as a noise floor.
+        self.q_spread_mode = getattr(args, "q_spread_mode", "gap")
+        assert self.q_spread_mode in ("gap", "mean"), (
+            f"q_spread_mode must be 'gap' or 'mean', got {self.q_spread_mode!r}"
+        )
 
         # ── Per-agent adaptive alpha_factor ──
         # Each agent gets its own alpha_factor from its InfoNCE coordination score.
@@ -181,24 +200,49 @@ class CASVDLearner:
             target_mac_out = th.stack(target_mac_out, dim=1)  # [B, T, n_agents, n_actions]
 
             if self.use_soft_values:
-                # ── Q-spread-relative soft values ──
+                # ── Q-spread-relative soft values (inverted-α, pure expectation) ──
                 #
-                # α_i(s,t) = max(alpha_factor_i × ΔQ_i, alpha_floor)
+                # α_i(s,t) = clip(alpha_factor_i / ΔQ_i, alpha_floor, alpha_factor_max)
                 # V_soft(s,i) = E_{π_soft}[Q_target(s,i,a)]
                 #
-                # Self-stabilizing: small Q-spread → small α → V_soft ≈ V_hard.
-                # Scale-invariant: softmax(Q/α) shape constant regardless of Q scale.
-                # No entropy bonus: it causes target inflation in QMIX (run 18 post-mortem).
+                # Direction (fixes Problem 1+2): large ΔQ → small α → sharp π
+                # (exploit dominant action). Small ΔQ → α saturates at cap → soft π
+                # (explore).
+                #
+                # No entropy bonus: adding α·H(π) to the target caused runaway
+                # inflation in practice. Per-agent Q is bounded by LayerNorm, so
+                # ΔQ stays small, α saturates at the cap, and the self-limiting
+                # loop never triggers. The mixer then amplifies the bounded
+                # per-agent bonus into unbounded Q_total, reproducing run 18's
+                # target inflation (q_taken grew 118→1360 in 50k steps, battle_won
+                # stuck at 0). Pure expectation is pessimistic (V_soft ≤ V_hard)
+                # but the pessimism vanishes asymptotically as π_soft → argmax
+                # in the learned regime.
 
                 # Online Q for Boltzmann probs (masked)
                 online_q = mac_out.clone().detach()
                 online_q[avail_actions == 0] = -1e10
 
-                # Q-spread: ΔQ(s,i) = max_a Q(s,i,a) - mean_a Q(s,i,a)
-                avail_count = avail_actions.sum(dim=-1, keepdim=True).clamp(min=1)
-                q_for_mean = mac_out.clone().detach() * avail_actions
-                q_mean_v = q_for_mean.sum(dim=-1, keepdim=True) / avail_count
-                q_spread = (online_q.max(dim=-1, keepdim=True)[0] - q_mean_v).clamp(min=1e-6)
+                # Q-spread: drives α = factor / q_spread. Two modes:
+                #
+                #   "gap"  → Q_max − Q_2nd_max (advantage gap, top-2 only).
+                #            Depends on exactly two values. Invariant to
+                #            removals of non-top-2 actions. Never references
+                #            untrained Q outputs from long-masked slots.
+                #
+                #   "mean" → Q_max − mean(mac_out) over ALL n_actions.
+                #            Denominator is constant (n_actions) and the
+                #            numerator doesn't touch avail_actions, so the
+                #            baseline is mask-independent. Includes untrained
+                #            outputs for masked slots as a noise floor.
+                if self.q_spread_mode == "gap":
+                    top2_q = online_q.topk(k=2, dim=-1).values  # [B,T,n,2]
+                    q_spread = (top2_q[..., :1] - top2_q[..., 1:2]).clamp(min=1e-6)
+                else:  # "mean"
+                    q_mean_v = mac_out.mean(dim=-1, keepdim=True)  # [B,T,n,1]
+                    q_spread = (
+                        online_q.max(dim=-1, keepdim=True)[0] - q_mean_v
+                    ).clamp(min=1e-6)
                 # q_spread: [B, T, n_agents, 1]
 
                 # Per-agent alpha_factor from coordination signal
@@ -211,10 +255,13 @@ class CASVDLearner:
                         device=current_batch.device,
                     )
 
-                # α_i = max(alpha_factor_i × ΔQ_i, alpha_floor)
-                # Q-spread multiplication makes alpha self-stabilizing and scale-invariant.
-                alpha_per = (af * q_spread).clamp(min=self.alpha_floor)
-                # alpha_per: [B, T, n_agents, 1] (already broadcast from af × q_spread)
+                # Inverted α: α_i = clip(alpha_factor_i / ΔQ_i, floor, factor_max)
+                # Large ΔQ (clear winner) → small α → sharp π (exploit).
+                # Small ΔQ (uniform Q)    → α saturates at factor_max → soft π (explore).
+                alpha_per = (af / q_spread).clamp(
+                    min=self.alpha_floor, max=self.alpha_factor_max
+                )
+                # alpha_per: [B, T, n_agents, 1]
 
                 # Log metrics
                 alpha_mean_for_log    = alpha_per.mean().item()
@@ -223,17 +270,28 @@ class CASVDLearner:
                 # Boltzmann policy (Double-Q: online selects)
                 online_probs = th.softmax(online_q / alpha_per, dim=-1)  # [B,T,n_agents,n_act]
 
-                # Entropy for logging only (not added to targets)
+                # Entropy of the soft policy — logged only, NOT added to v_soft.
+                # (An α·H bonus in the target caused run-18-style inflation
+                # because the mixer amplifies bounded per-agent values
+                # unboundedly, so the inverted-α self-limiting loop fails to
+                # kick in. See casvd_design.md post-mortem.)
+                # log_probs for unavailable actions ≈ -∞ (Q=-1e10); probs ≈ 0.
+                # 0 × -∞ = NaN in IEEE 754, so clamp the log before multiplying.
                 log_probs = th.log_softmax(online_q / alpha_per, dim=-1)
-                entropy   = -(online_probs * log_probs).sum(dim=-1)  # [B, T, n_agents]
+                entropy   = -(online_probs * log_probs.clamp(min=-50)).sum(dim=-1)  # [B, T, n_agents]
                 entropy_mean_for_log = entropy.mean().item()
 
-                # Target Q-values for evaluation (Double-Q: target evaluates)
+                # Target Q-values for evaluation (Double-Q: target evaluates).
+                # Zero-mask (not -1e10) so unavailable actions contribute exactly 0
+                # to the expectation regardless of floating-point noise on probs.
                 target_q_for_v = target_mac_out.clone()
-                target_q_for_v[avail_actions == 0] = -1e10
+                target_q_for_v[avail_actions == 0] = 0.0
 
-                # V_soft = E_π[Q_target]  (no entropy bonus)
-                v_soft = (online_probs * target_q_for_v).sum(dim=-1)  # [B, T, n_agents]
+                # Soft V: V = E_π[Q_target] (pure expectation, no entropy bonus).
+                # Accepts the V_soft ≤ V_hard pessimism, which is mild: once the
+                # inverted-α drives π_soft toward argmax for learned states,
+                # V_soft ≈ V_hard asymptotically.
+                v_soft = (online_probs * target_q_for_v).sum(dim=-1)  # [B,T,n_agents]
 
                 # Mix through target mixer
                 target_q_total = self.target_mixer(

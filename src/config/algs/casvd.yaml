@@ -58,20 +58,34 @@ grad_norm_clip: 10
 standardise_returns: False
 standardise_rewards: False
 
-# ── Q-spread-relative soft values ────────────────────────────
-# α_i(s,t) = max(alpha_factor_i × ΔQ_i, alpha_floor)
+# ── Inverted-α soft targets (pure expectation, no entropy bonus) ──
+# α_i(s,t) = clip(alpha_factor_i / ΔQ_i, alpha_floor, alpha_factor_max)
 #   where ΔQ_i = max(Q_i) - mean(Q_i)  (per-agent Q-spread)
-# Scale-invariant: softmax shape constant in ΔQ units.
-# Self-stabilizing: Q suppression → smaller ΔQ → smaller α → less suppression.
-# V_soft = E_π[Q_target] (no entropy bonus — it causes target inflation in QMIX).
-# With alpha_factor_max=0.3: logit_diff = 1/0.15 ≈ 6.7 → 99% on best action
-# → V_soft ≈ V_hard, eliminating underestimation tax vs QMIX.
+# Large ΔQ (clear winner)  → small α → sharp π (exploit dominant action).
+# Small ΔQ (uniform Q)     → α saturates at cap → soft π (explore).
+# V_soft = E_π[Q_target] (pure expectation). No α·H(π) entropy bonus:
+# adding it caused runaway target inflation because per-agent Q is bounded
+# by LayerNorm (inverted-α self-limiting never triggers), and the mixer
+# then amplifies the bounded per-agent bonus into unbounded Q_total —
+# the same failure mode as the original run 18. Accepts the mild
+# V_soft ≤ V_hard pessimism, which vanishes as π_soft sharpens.
+# NOTE: alpha_factor_max here is the CAP on effective α, not a multiplier.
 use_soft_values: True
 alpha_factor_init: 0.3        # initial alpha_factor (used on first step before InfoNCE runs)
 alpha_factor_min: 0.0         # hard-max when coordination is perfect
-alpha_factor_max: 0.3         # with Q-spread relative: effective alpha ≈ 0.007 (near hard-max)
-alpha_floor: 0.005            # minimum alpha when q_spread × factor is tiny
+alpha_factor_max: 0.3         # cap on effective α (max softness)
+alpha_floor: 0.005            # minimum α (max sharpness)
 soft_value_warmup_steps: 0
+
+# How ΔQ (drives α = factor / ΔQ) is measured:
+#   "gap"  → Q_max − Q_2nd_max (advantage gap, top-2 only).
+#            Invariant to kills of non-top-2 actions (e.g. enemies the
+#            agent wasn't targeting). Ignores untrained Q outputs from
+#            long-masked slots entirely. Recommended default.
+#   "mean" → Q_max − mac_out.mean() (unmasked mean over all n_actions).
+#            Denominator constant; numerator mask-independent; but
+#            includes untrained outputs for masked slots as a noise floor.
+q_spread_mode: "gap"
 
 # ── InfoNCE coordination sensor ──────────────────────────────
 # Uses GRU hidden states (not local_summary) for per-agent differentiation:
