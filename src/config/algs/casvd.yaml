@@ -58,39 +58,41 @@ grad_norm_clip: 10
 standardise_returns: False
 standardise_rewards: False
 
-# ── Q-spread-relative soft values ────────────────────────────
-# α_i(s,t) = max(alpha_factor_i × ΔQ_i, alpha_floor)
-#   where ΔQ_i = max(Q_i) - mean(Q_i)  (per-agent Q-spread)
-# Scale-invariant: softmax shape constant in ΔQ units.
-# Self-stabilizing: Q suppression → smaller ΔQ → smaller α → less suppression.
-# V_soft = E_π[Q_target] (no entropy bonus — it causes target inflation in QMIX).
-# With alpha_factor_max=0.3: logit_diff = 1/0.15 ≈ 6.7 → 99% on best action
-# → V_soft ≈ V_hard, eliminating underestimation tax vs QMIX.
+# ── Option B: Soft Bellman backup via logsumexp ──────────────
+# V_soft(s,i) = entropy_coef · log Σ_a exp(Q_target(s,i,a) / entropy_coef)
+#             = E_π[Q_target] + entropy_coef · H(π)
+#
+# Proper entropy-regularised soft value: V_soft ≥ max_a Q_target by α·H(π).
+# Replaces the previous broken E_π[Q_target] form which was strictly ≤ max.
+# The q-spread-relative adaptive machinery is gone — it was scale-invariant,
+# not exploration-when-uncertain, and pinned α at the floor in practice.
+#
+# Tune entropy_coef in [0.05, 0.2].  Larger = softer targets / more
+# exploration pressure.  Watch entropy_mean in the logs:
+#   entropy ≈ 0     → α too small, acting like hard-max
+#   entropy ≈ log|A_avail| → α too large, policy is ~uniform
+#   entropy ≈ 0.3–0.7 × log|A_avail| → sweet spot
 use_soft_values: True
-alpha_factor_init: 0.3        # initial alpha_factor (used on first step before InfoNCE runs)
-alpha_factor_min: 0.0         # hard-max when coordination is perfect
-alpha_factor_max: 0.3         # with Q-spread relative: effective alpha ≈ 0.007 (near hard-max)
-alpha_floor: 0.005            # minimum alpha when q_spread × factor is tiny
-soft_value_warmup_steps: 0
+entropy_coef: 0.1
 
-# ── InfoNCE coordination sensor ──────────────────────────────
-# Uses GRU hidden states (not local_summary) for per-agent differentiation:
-# hidden states encode action-observation history, naturally distinct per agent.
-# Agent i predicts mean of OTHER agents' hidden states at t+1 (g_others_i).
-# Per-agent signal: high InfoNCE loss = poor coordination.
-# Gradient-isolated: hidden states are DETACHED before predictor.
-lgdd_enabled: True
-lgdd_lr: 0.0003
-infonce_n_negatives: 15       # K negative samples per positive
-infonce_temperature: 0.1      # softmax temperature τ
+# ── Disabled for Option B baseline test ──────────────────────
+# InfoNCE predictor + dual backward pass + per-agent adaptive α are all
+# turned off so the logsumexp fix is validated in isolation.  Re-enable
+# after confirming the soft-value backbone is healthy.
+lgdd_enabled: False
+use_adaptive_alpha: False
 
-# ── Per-agent adaptive alpha_factor ──────────────────────────
-# alpha_factor_i = α_min + (α_max - α_min) × coord_signal_i
-# coord_signal_i = InfoNCE_loss_i / log(K+1), normalized to [0, 1]
-# High InfoNCE loss (poor coordination) → larger alpha_factor → softer targets
-# Low InfoNCE loss (good coordination) → smaller alpha_factor → near hard-max
-use_adaptive_alpha: True
-coord_signal_ema_tau: 0.999    # smooth EMA — proven stable in runs 15-16
+# ── Legacy (Option A) hyperparams — inert when the flags above are False.
+# Kept here for one-line revival later:
+#   alpha_factor_init: 0.3
+#   alpha_factor_min: 0.0
+#   alpha_factor_max: 0.3
+#   alpha_floor: 0.005
+#   soft_value_warmup_steps: 0
+#   lgdd_lr: 0.0003
+#   infonce_n_negatives: 15
+#   infonce_temperature: 0.1
+#   coord_signal_ema_tau: 0.999
 
 # ── Continual learning ────────────────────────────────────────
 cl_enabled: False

@@ -46,12 +46,19 @@ class CASVDLearner:
         self.mixer = NMixer(args)
         self.target_mixer = copy.deepcopy(self.mixer)
 
-        # ── Q-spread-relative soft value decomposition ──
-        # α_i = max(alpha_factor_i × ΔQ_i, alpha_floor)
-        # V_soft(s,i) = E_{π_soft}[Q_target(s,i,a)]  (no entropy bonus)
-        # alpha_factor_i = alpha_min + (alpha_max - alpha_min) × coord_signal_i
+        # ── Option B: Soft Bellman backup via logsumexp ──
+        # V_soft(s,i) = entropy_coef · log Σ_a exp(Q_target(s,i,a) / entropy_coef)
+        #             = E_π[Q_target] + entropy_coef · H(π)
+        # Proper entropy-regularised soft value (V_soft ≥ max Q by α·H(π)),
+        # replacing the previous broken E_π[Q_target] form which was strictly
+        # ≤ max Q and therefore strictly worse than hard-max QMIX.
         self.use_soft_values = getattr(args, "use_soft_values", False)
-        self.alpha_factor = getattr(args, "alpha_factor_init", 0.5)   # fallback scalar
+        self.entropy_coef = getattr(args, "entropy_coef", 0.1)
+
+        # Legacy (Option A) scale-invariant params — retained only so that
+        # loading an old checkpoint / config does not crash.  They are NOT
+        # used by the soft-value branch below when use_adaptive_alpha=False.
+        self.alpha_factor = getattr(args, "alpha_factor_init", 0.5)
         self.alpha_factor_min = getattr(args, "alpha_factor_min", 0.0)
         self.alpha_factor_max = getattr(args, "alpha_factor_max", 0.3)
         self.alpha_floor = getattr(args, "alpha_floor", 0.005)
@@ -181,66 +188,57 @@ class CASVDLearner:
             target_mac_out = th.stack(target_mac_out, dim=1)  # [B, T, n_agents, n_actions]
 
             if self.use_soft_values:
-                # ── Q-spread-relative soft values ──
+                # ── Option B: Soft Bellman backup via logsumexp ───────────────
                 #
-                # α_i(s,t) = max(alpha_factor_i × ΔQ_i, alpha_floor)
-                # V_soft(s,i) = E_{π_soft}[Q_target(s,i,a)]
+                # V_soft(s,i) = α · log Σ_a exp(Q_target(s,i,a) / α)
+                #             = E_{π_soft}[Q_target(s,i,a)] + α · H(π_soft)
                 #
-                # Self-stabilizing: small Q-spread → small α → V_soft ≈ V_hard.
-                # Scale-invariant: softmax(Q/α) shape constant regardless of Q scale.
-                # No entropy bonus: it causes target inflation in QMIX (run 18 post-mortem).
+                # This is the proper entropy-regularised soft value.  Unlike
+                # the previous E_π[Q_target] form (always ≤ max Q, strictly
+                # worse than hard-max), this satisfies V_soft ≥ max_a Q_target
+                # by α · H(π).  Known contraction to the soft-optimal value
+                # (standard SAC / soft-Q-learning backup).
+                #
+                # α is fixed at self.entropy_coef.  The q-spread-relative
+                # adaptive machinery has been removed — it was scale-invariant
+                # (not exploration-when-uncertain) and pinned at the floor.
+                alpha = self.entropy_coef
 
-                # Online Q for Boltzmann probs (masked)
+                # Mask unavailable actions before logsumexp.  -1e10 / α is
+                # still a finite number (e.g. -1e11 at α=0.1); log_softmax
+                # and logsumexp stay numerically stable because exp(-1e11)
+                # underflows cleanly to 0 without producing NaNs.
+                target_q_masked = target_mac_out.clone()
+                target_q_masked[avail_actions == 0] = -1e10
+
+                # Per-agent soft value
+                v_soft = alpha * th.logsumexp(
+                    target_q_masked / alpha, dim=-1
+                )
+                # v_soft: [B, T, n_agents]
+
+                # ── Diagnostics only (not part of the loss) ────────────────
+                # Log the online soft policy's entropy and the fixed α so we
+                # can monitor whether the soft-value branch is actually doing
+                # anything (compared to hard-max).
                 online_q = mac_out.clone().detach()
                 online_q[avail_actions == 0] = -1e10
+                online_log_probs = th.log_softmax(online_q / alpha, dim=-1)
+                online_probs = th.exp(online_log_probs)
+                avail_f = avail_actions.float()
+                entropy = -(online_probs * online_log_probs * avail_f).sum(dim=-1)
+                # entropy: [B, T, n_agents]
 
-                # Q-spread: ΔQ(s,i) = max_a Q(s,i,a) - mean_a Q(s,i,a)
-                avail_count = avail_actions.sum(dim=-1, keepdim=True).clamp(min=1)
-                q_for_mean = mac_out.clone().detach() * avail_actions
-                q_mean_v = q_for_mean.sum(dim=-1, keepdim=True) / avail_count
-                q_spread = (online_q.max(dim=-1, keepdim=True)[0] - q_mean_v).clamp(min=1e-6)
-                # q_spread: [B, T, n_agents, 1]
+                alpha_mean_for_log    = float(alpha)
+                q_spread_mean_for_log = 0.0                  # unused in Option B
+                entropy_mean_for_log  = entropy.mean().item()
 
-                # Per-agent alpha_factor from coordination signal
-                if self.use_adaptive_alpha and self._coord_signals is not None:
-                    af = self._coord_signals.view(1, 1, self.n_agents, 1)
-                    af = self.alpha_factor_min + (self.alpha_factor_max - self.alpha_factor_min) * af
-                else:
-                    af = th.full(
-                        (1, 1, self.n_agents, 1), self.alpha_factor,
-                        device=current_batch.device,
-                    )
-
-                # α_i = max(alpha_factor_i × ΔQ_i, alpha_floor)
-                # Q-spread multiplication makes alpha self-stabilizing and scale-invariant.
-                alpha_per = (af * q_spread).clamp(min=self.alpha_floor)
-                # alpha_per: [B, T, n_agents, 1] (already broadcast from af × q_spread)
-
-                # Log metrics
-                alpha_mean_for_log    = alpha_per.mean().item()
-                q_spread_mean_for_log = q_spread.mean().item()
-
-                # Boltzmann policy (Double-Q: online selects)
-                online_probs = th.softmax(online_q / alpha_per, dim=-1)  # [B,T,n_agents,n_act]
-
-                # Entropy for logging only (not added to targets)
-                log_probs = th.log_softmax(online_q / alpha_per, dim=-1)
-                entropy   = -(online_probs * log_probs).sum(dim=-1)  # [B, T, n_agents]
-                entropy_mean_for_log = entropy.mean().item()
-
-                # Target Q-values for evaluation (Double-Q: target evaluates)
-                target_q_for_v = target_mac_out.clone()
-                target_q_for_v[avail_actions == 0] = -1e10
-
-                # V_soft = E_π[Q_target]  (no entropy bonus)
-                v_soft = (online_probs * target_q_for_v).sum(dim=-1)  # [B, T, n_agents]
-
-                # Mix through target mixer
+                # Mix per-agent soft values through the target mixer
                 target_q_total = self.target_mixer(
                     v_soft, current_batch["state"]
                 )  # [B, T, 1]
 
-                # td_lambda multi-step returns
+                # TD(λ) multi-step returns
                 targets = build_td_lambda_targets(
                     rewards, terminated, mask,
                     target_q_total, self.n_agents,
@@ -486,8 +484,12 @@ class CASVDLearner:
                 t_env,
             )
             if self.use_soft_values:
-                self.logger.log_stat("alpha_factor", self.alpha_factor, t_env)
+                # Option B: fixed α (entropy_coef), no q-spread, no adaptive factor.
+                # `alpha_factor` / `q_spread_mean` are legacy log keys kept at
+                # zero so downstream log parsers don't break.
+                self.logger.log_stat("entropy_coef", float(self.entropy_coef), t_env)
                 self.logger.log_stat("alpha_mean", alpha_mean_for_log, t_env)
+                self.logger.log_stat("alpha_factor", 0.0, t_env)
                 self.logger.log_stat("q_spread_mean", q_spread_mean_for_log, t_env)
                 self.logger.log_stat("entropy_mean", entropy_mean_for_log, t_env)
             if self.lgdd_enabled:

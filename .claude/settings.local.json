@@ -9,7 +9,9 @@
       "Bash(find /Users/aimslab-imac2/Downloads/pymarl2-with-smacv2-extra/results -name *.tb -o -name events.out.tfevents*)",
       "Bash(python3:*)",
       "Bash(find /Users/aimslab-imac2/Downloads/pymarl2-with-smacv2-extra -type d -name *run* -o -type d -name *results* -o -type d -name *outputs* -o -type d -name *sacred* -o -type d -name *logs*)",
-      "Bash(wc -l /Users/aimslab-imac2/Downloads/pymarl2-with-smacv2-extra/src/components/*.py /Users/aimslab-imac2/Downloads/pymarl2-with-smacv2-extra/src/learners/*.py)"
+      "Bash(wc -l /Users/aimslab-imac2/Downloads/pymarl2-with-smacv2-extra/src/components/*.py /Users/aimslab-imac2/Downloads/pymarl2-with-smacv2-extra/src/learners/*.py)",
+      "Bash(xargs ls:*)",
+      "Bash(grep:*)"
     ]
   }
 }
