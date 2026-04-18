@@ -6,30 +6,24 @@ import torch as th
 import torch.nn.functional as F
 from torch.optim import Adam
 
-from modules.mixers.nmix import Mixer as NMixer
+from modules.mixers.soft_mix import SoftMixer
 from utils.rl_utils import build_td_lambda_targets
 
 
 class CASVDLearner:
-    """Coordination-Aware Soft Value Decomposition learner.
+    """CASVD learner — Soft-QMIX backbone with GAT encoder.
 
-    Combines:
-    - GAT encoder with parameter sharing (shared Q-head, no tanh squashing)
-    - QMIX mixer for value decomposition with monotonicity
-    - Q-spread-relative soft value targets (no entropy bonus):
-        α_i = max(alpha_factor_i × ΔQ_i, alpha_floor)
-        V_soft(s,i) = E_{π_soft}[Q_target(s,i,a)]
-      Self-stabilizing: small Q-spread → small α → V_soft ≈ V_hard.
-      Scale-invariant: softmax shape constant regardless of Q-value scale.
-    - Per-agent alpha_factor from coordination signal:
-        alpha_factor_i = α_min + (α_max - α_min) × coord_signal_i
-        coord_signal_i = 0 → well-coordinated → near hard-max (exploit)
-        coord_signal_i = 1 → poorly-coordinated → softer targets (explore)
-    - InfoNCE coordination sensor (gradient-isolated, uses GRU hidden states):
-        Agent i predicts mean of OTHER agents' hidden states at t+1.
-        Hidden states encode action-observation history → naturally distinct
-        per agent → genuine coord_signal differentiation.
-    - Continual learning with teacher distillation
+    Architecture (Component 2: Soft-QMIX port):
+    - SoftMixer: VDN forward + func_g (order-preserving Q shaping)
+      + func_f (learned per-agent temperature for soft policy).
+    - Soft policy: softmax(func_f(func_g(Q_online)) / α) for rollout
+      and target action sampling.
+    - Sample-based entropy estimate added to TD(λ) targets.
+    - Beta loss keeps func_f ≈ identity.
+    - Weighted TD loss for stability.
+
+    Components 3 (InfoNCE) and 4 (adaptive α) are retained in code
+    but gated by lgdd_enabled / use_adaptive_alpha flags (off by default).
     """
 
     def __init__(self, mac, scheme, logger, args):
@@ -42,37 +36,19 @@ class CASVDLearner:
         # Target network
         self.target_mac = copy.deepcopy(self.mac)
 
-        # QMIX-style mixer from nmix.py
-        self.mixer = NMixer(args)
+        # ── Soft-QMIX mixer: VDN + func_f + func_g ──
+        self.mixer = SoftMixer(args)
         self.target_mixer = copy.deepcopy(self.mixer)
+        self.mac.set_mixer(self.mixer)
 
-        # ── Option B: Soft Bellman backup via logsumexp ──
-        # V_soft(s,i) = entropy_coef · log Σ_a exp(Q_target(s,i,a) / entropy_coef)
-        #             = E_π[Q_target] + entropy_coef · H(π)
-        # Proper entropy-regularised soft value (V_soft ≥ max Q by α·H(π)),
-        # replacing the previous broken E_π[Q_target] form which was strictly
-        # ≤ max Q and therefore strictly worse than hard-max QMIX.
-        self.use_soft_values = getattr(args, "use_soft_values", False)
-        self.entropy_coef = getattr(args, "entropy_coef", 0.1)
+        self.entropy_coef = getattr(args, "entropy_coef", 0.03)
 
-        # Legacy (Option A) scale-invariant params — retained only so that
-        # loading an old checkpoint / config does not crash.  They are NOT
-        # used by the soft-value branch below when use_adaptive_alpha=False.
-        self.alpha_factor = getattr(args, "alpha_factor_init", 0.5)
-        self.alpha_factor_min = getattr(args, "alpha_factor_min", 0.0)
-        self.alpha_factor_max = getattr(args, "alpha_factor_max", 0.3)
-        self.alpha_floor = getattr(args, "alpha_floor", 0.005)
-        self.soft_value_warmup_steps = getattr(args, "soft_value_warmup_steps", 0)
-
-        # ── Per-agent adaptive alpha_factor ──
-        # Each agent gets its own alpha_factor from its InfoNCE coordination score.
-        # alpha_factor_i = α_min + (α_max - α_min) × coord_signal_i
+        # ── Per-agent adaptive alpha (off by default) ──
         self.use_adaptive_alpha = getattr(args, "use_adaptive_alpha", False)
-        # Per-agent coord signals, stored as [n_agents] tensor (EMA-smoothed)
-        self._coord_signals = None  # lazily initialized
+        self._coord_signals = None
         self.coord_signal_ema_tau = getattr(args, "coord_signal_ema_tau", 0.99)
 
-        # ── InfoNCE coordination sensor (gradient-isolated) ──
+        # ── InfoNCE coordination sensor (off by default) ──
         self.lgdd_enabled = getattr(args, "lgdd_enabled", False)
         self.infonce_n_negatives = getattr(args, "infonce_n_negatives", 15)
         self.infonce_temperature = getattr(args, "infonce_temperature", 0.1)
@@ -89,7 +65,7 @@ class CASVDLearner:
             )
             self.dynamics_params = list(self.dynamics_predictor.parameters())
 
-        # ── Continual learning ──
+        # ── Continual learning (off by default) ──
         self.cl_enabled = getattr(args, "cl_enabled", False)
         self.cl_distill_weight = getattr(args, "cl_distill_weight", 0.0)
         self.cl_teacher_ema_tau = getattr(args, "cl_teacher_ema_tau", 0.002)
@@ -99,9 +75,7 @@ class CASVDLearner:
             self.cl_teacher_mac = copy.deepcopy(self.mac)
             self._freeze_mac(self.cl_teacher_mac)
 
-        # ── Optimizers: fully separate main and LGDD ──
-        # Main optimizer: encoder + Q-head + mixer (TD + CL gradients)
-        # LGDD optimizer: predictor MLP only (LGDD gradients, isolated)
+        # ── Optimizers ──
         opt_eps = getattr(args, "optimizer_epsilon", 1e-7)
         self.main_params = list(self.mac.parameters()) + list(self.mixer.parameters())
         self.main_optimizer = Adam(self.main_params, lr=args.lr, eps=opt_eps)
@@ -112,9 +86,7 @@ class CASVDLearner:
         else:
             self.lgdd_optimizer = None
 
-        # For grad clipping compatibility
         self.params = self.main_params
-
         self.last_target_update_episode = 0
         self.log_stats_t = -self.args.learner_log_interval - 1
 
@@ -132,7 +104,7 @@ class CASVDLearner:
         return self._coord_signals
 
     def train(self, batch, t_env, episode_num, current_batch_size=None, memory_batch_size=0):
-        # ── Split batch: TD+LGDD on current portion only ──
+        # ── Split batch for CL ──
         actual_current = current_batch_size if current_batch_size is not None else batch.batch_size
         if memory_batch_size > 0 and batch.batch_size > actual_current:
             current_batch = batch[:actual_current]
@@ -141,307 +113,127 @@ class CASVDLearner:
             current_batch = batch
             memory_batch = None
 
-        rewards = current_batch["reward"][:, :-1]                        # [B, T-1, 1]
-        actions = current_batch["actions"][:, :-1]                       # [B, T-1, n_agents, 1]
-        terminated = current_batch["terminated"][:, :-1].float()         # [B, T-1, 1]
-        mask = current_batch["filled"][:, :-1].float()                   # [B, T-1, 1]
+        rewards = current_batch["reward"][:, :-1]
+        actions = current_batch["actions"][:, :-1]
+        terminated = current_batch["terminated"][:, :-1].float()
+        mask = current_batch["filled"][:, :-1].float()
         mask[:, 1:] = mask[:, 1:] * (1 - terminated[:, :-1])
-        avail_actions = current_batch["avail_actions"]                   # [B, T, n_agents, n_actions]
+        avail_actions = current_batch["avail_actions"]
+        states = current_batch["state"]
 
         # ═══════════════════════════════════════════════════════
-        # 1. Forward pass: Q-values + latents for LGDD
+        # 1. Online forward: raw Q → func_g → mac_out
         # ═══════════════════════════════════════════════════════
         self.mac.init_hidden(current_batch.batch_size)
         mac_out = []
-        all_latents = []
-        all_hidden = []   # GRU hidden states for InfoNCE (more agent-specific than local_summary)
-
         for t in range(current_batch.max_seq_length):
-            if self.lgdd_enabled:
-                q_values, latents = self.mac.forward_with_latents(current_batch, t)
-                all_latents.append(latents)
-                all_hidden.append(self.mac.hidden_states.detach().clone())
-            else:
-                q_values = self.mac.forward(current_batch, t)
+            q_values = self.mac.forward(current_batch, t)
             mac_out.append(q_values)
+        mac_out = th.stack(mac_out, dim=1)
+        mac_out = self.mixer.func_g(mac_out, states, t_env)
 
-        mac_out = th.stack(mac_out, dim=1)  # [B, T, n_agents, n_actions]
-
-        # Chosen action Q-values
         chosen_action_qvals = th.gather(
             mac_out[:, :-1], dim=3, index=actions
-        ).squeeze(3)  # [B, T-1, n_agents]
+        ).squeeze(3)
 
         # ═══════════════════════════════════════════════════════
-        # 2. Target Q-values with double-Q and td_lambda
+        # 2. Target: func_g(Q_target) + soft policy sampling
         # ═══════════════════════════════════════════════════════
-        alpha_mean_for_log   = 0.0
-        q_spread_mean_for_log = 0.0
-        entropy_mean_for_log  = 0.0
-
         with th.no_grad():
             self.target_mac.init_hidden(current_batch.batch_size)
             target_mac_out = []
             for t in range(current_batch.max_seq_length):
                 target_q = self.target_mac.forward(current_batch, t)
                 target_mac_out.append(target_q)
-            target_mac_out = th.stack(target_mac_out, dim=1)  # [B, T, n_agents, n_actions]
+            target_mac_out = th.stack(target_mac_out, dim=1)
+            target_mac_out = self.target_mixer.func_g(target_mac_out, states, t_env)
 
-            if self.use_soft_values:
-                # ── Option B: Soft Bellman backup via logsumexp ───────────────
-                #
-                # V_soft(s,i) = α · log Σ_a exp(Q_target(s,i,a) / α)
-                #             = E_{π_soft}[Q_target(s,i,a)] + α · H(π_soft)
-                #
-                # This is the proper entropy-regularised soft value.  Unlike
-                # the previous E_π[Q_target] form (always ≤ max Q, strictly
-                # worse than hard-max), this satisfies V_soft ≥ max_a Q_target
-                # by α · H(π).  Known contraction to the soft-optimal value
-                # (standard SAC / soft-Q-learning backup).
-                #
-                # α is fixed at self.entropy_coef.  The q-spread-relative
-                # adaptive machinery has been removed — it was scale-invariant
-                # (not exploration-when-uncertain) and pinned at the floor.
-                alpha = self.entropy_coef
+            # Soft policy from online net (Double-Q: online selects)
+            mac_out_detach = mac_out.clone().detach()
+            mac_out_detach = self.mixer.func_f(mac_out_detach, states, t_env)
+            mac_out_detach = mac_out_detach / self.entropy_coef
+            mac_out_detach[avail_actions == 0] = -9999999
+            actions_pdf = th.softmax(mac_out_detach, dim=-1)
 
-                # Mask unavailable actions before logsumexp.  -1e10 / α is
-                # still a finite number (e.g. -1e11 at α=0.1); log_softmax
-                # and logsumexp stay numerically stable because exp(-1e11)
-                # underflows cleanly to 0 without producing NaNs.
-                target_q_masked = target_mac_out.clone()
-                target_q_masked[avail_actions == 0] = -1e10
+            # Sample actions via CDF trick (numerically stable)
+            rand_idx = th.rand(
+                actions_pdf[:, :, :, :1].shape, device=actions_pdf.device
+            )
+            actions_cdf = th.cumsum(actions_pdf, dim=-1)
+            rand_idx = th.clamp(rand_idx, 1e-6, 1 - 1e-6)
+            picked_actions = th.searchsorted(actions_cdf, rand_idx)
 
-                # Per-agent soft value
-                v_soft = alpha * th.logsumexp(
-                    target_q_masked / alpha, dim=-1
-                )
-                # v_soft: [B, T, n_agents]
+            # Target Q at sampled actions (Double-Q: target evaluates)
+            target_qvals = th.gather(
+                target_mac_out.clone(), 3, picked_actions
+            ).squeeze(3)
 
-                # ── Diagnostics only (not part of the loss) ────────────────
-                # Log the online soft policy's entropy and the fixed α so we
-                # can monitor whether the soft-value branch is actually doing
-                # anything (compared to hard-max).
-                online_q = mac_out.clone().detach()
-                online_q[avail_actions == 0] = -1e10
-                online_log_probs = th.log_softmax(online_q / alpha, dim=-1)
-                online_probs = th.exp(online_log_probs)
-                avail_f = avail_actions.float()
-                entropy = -(online_probs * online_log_probs * avail_f).sum(dim=-1)
-                # entropy: [B, T, n_agents]
+            # Single-sample entropy estimate: -Σ_i log π_i(a*_i)
+            target_logp = th.log(actions_pdf + 1e-10)
+            target_logp = th.gather(target_logp, 3, picked_actions).squeeze(3)
+            target_entropy = -target_logp.sum(-1, keepdim=True)
 
-                alpha_mean_for_log    = float(alpha)
-                q_spread_mean_for_log = 0.0                  # unused in Option B
-                entropy_mean_for_log  = entropy.mean().item()
+            # Mix sampled target Q through VDN sum
+            target_qvals = self.target_mixer(target_qvals, states)
 
-                # Mix per-agent soft values through the target mixer
-                target_q_total = self.target_mixer(
-                    v_soft, current_batch["state"]
-                )  # [B, T, 1]
-
-                # TD(λ) multi-step returns
-                targets = build_td_lambda_targets(
-                    rewards, terminated, mask,
-                    target_q_total, self.n_agents,
-                    self.args.gamma, self.args.td_lambda,
-                )  # [B, T-1, 1]
-
-            else:
-                # ── Standard hard max target (QMIX-style) ──
-                mac_out_detach = mac_out.clone().detach()
-                mac_out_detach[avail_actions == 0] = -1e10
-                cur_max_actions = mac_out_detach.max(dim=3, keepdim=True)[1]
-
-                target_max_qvals = th.gather(
-                    target_mac_out, dim=3, index=cur_max_actions
-                ).squeeze(3)  # [B, T, n_agents]
-
-                target_max_qvals = self.target_mixer(
-                    target_max_qvals, current_batch["state"]
-                )  # [B, T, 1]
-
-                targets = build_td_lambda_targets(
-                    rewards, terminated, mask,
-                    target_max_qvals, self.n_agents,
-                    self.args.gamma, self.args.td_lambda,
-                )  # [B, T-1, 1]
-
-        # ═══════════════════════════════════════════════════════
-        # 3. Mix chosen Q-values through QMIX
-        # ═══════════════════════════════════════════════════════
-        agent_chosen_qvals = chosen_action_qvals
-        chosen_action_qvals = self.mixer(
-            chosen_action_qvals, current_batch["state"][:, :-1]
-        )  # [B, T-1, 1]
-
-        # ═══════════════════════════════════════════════════════
-        # 4. TD loss
-        # ═══════════════════════════════════════════════════════
-        td_error = chosen_action_qvals - targets.detach()
-        masked_td_error = 0.5 * (td_error ** 2) * mask
-        td_loss = masked_td_error.sum() / mask.sum()
-
-        # ═══════════════════════════════════════════════════════
-        # 5. InfoNCE coordination sensor (gradient-isolated)
-        #    Measures mutual information between each agent's local
-        #    embedding and the team's global future state.
-        #    Encoder outputs are DETACHED — InfoNCE gradients never
-        #    reach the encoder. Only the bilinear W matrix is trained.
-        # ═══════════════════════════════════════════════════════
-        infonce_loss = th.tensor(0.0, device=current_batch.device)
-        infonce_error = 0.0
-        coord_signal_mean = 0.0
-
-        # Embedding stat holders — populated inside lgdd block, logged below
-        local_emb_mean        = 0.0
-        local_emb_std         = 0.0
-        local_emb_min         = 0.0
-        local_emb_max         = 0.0
-        local_emb_norm_mean   = 0.0
-        team_emb_mean         = 0.0
-        team_emb_std          = 0.0
-        team_emb_min          = 0.0
-        team_emb_max          = 0.0
-        team_emb_norm_mean    = 0.0
-        global_emb_mean       = 0.0
-        global_emb_std        = 0.0
-        global_emb_min        = 0.0
-        global_emb_max        = 0.0
-        global_emb_norm_mean  = 0.0
-        local_emb_dead_frac   = 0.0   # fraction of near-zero local embeddings (collapsed dims)
-
-        if self.lgdd_enabled:
-            T = current_batch.max_seq_length
-            mask_squeezed = mask.squeeze(-1)   # [B, T-1]
-
-            # ── GRU hidden states for InfoNCE ─────────────────────────
-            # Hidden states encode action-observation history → naturally
-            # distinct per agent (unlike local_summary which is a snapshot
-            # of current observations and tends to be similar across agents
-            # in the same battle). This enables genuine per-agent coord_signal
-            # differentiation.
-            all_h = th.stack(all_hidden, dim=0)  # [T, B, n_agents, D]
-
-            # ── Local GAT embedding stats (kept for diagnostics) ──────
-            all_local = th.stack(
-                [lat["local_summary"].detach() for lat in all_latents], dim=0
-            )  # [T, B, n_agents, D]
-            local_emb_mean       = all_local.mean().item()
-            local_emb_std        = all_local.std().item()
-            local_emb_min        = all_local.min().item()
-            local_emb_max        = all_local.max().item()
-            local_norms          = all_local.norm(dim=-1)
-            local_emb_norm_mean  = local_norms.mean().item()
-            local_emb_dead_frac  = (local_norms < 0.01).float().mean().item()
-
-            # ── Team GAT embedding stats ───────────────────────────────
-            if all_latents and "team_summary" in all_latents[0]:
-                all_team = th.stack(
-                    [lat["team_summary"].detach() for lat in all_latents], dim=0
-                )  # [T, B, n_agents, D]
-                team_emb_mean      = all_team.mean().item()
-                team_emb_std       = all_team.std().item()
-                team_emb_min       = all_team.min().item()
-                team_emb_max       = all_team.max().item()
-                team_emb_norm_mean = all_team.norm(dim=-1).mean().item()
-
-            # ── InfoNCE targets from hidden states ─────────────────────
-            # Global team mean at each timestep (for negatives)
-            g_all = all_h.mean(dim=2)  # [T, B, D]
-
-            # Per-agent "others mean": mean of OTHER agents' hidden states.
-            # Agent i's target excludes itself → genuinely different across agents.
-            if self.n_agents > 1:
-                team_sum = all_h.sum(dim=2, keepdim=True)   # [T, B, 1, D]
-                g_others = (team_sum - all_h) / (self.n_agents - 1)  # [T, B, n_agents, D]
-            else:
-                g_others = all_h  # degenerate: single agent
-
-            # ── Global embedding stats (from hidden states now) ────────
-            global_emb_mean      = g_all.mean().item()
-            global_emb_std       = g_all.std().item()
-            global_emb_min       = g_all.min().item()
-            global_emb_max       = g_all.max().item()
-            global_emb_norm_mean = g_all.norm(dim=-1).mean().item()
-
-            # Compute InfoNCE loss for timesteps 0..T-2 (predicting t+1)
-            K = self.infonce_n_negatives
-            all_per_agent_loss = []
-
-            for t in range(T - 1):
-                h_i = all_h[t]               # [B, n_agents, D] — agent i's hidden state at t
-                g_pos = g_others[t + 1]      # [B, n_agents, D] — per-agent others-future
-
-                # Sample K negatives: global team mean at random timesteps.
-                neg_indices = []
-                for _ in range(K):
-                    idx = th.randint(0, T, (1,)).item()
-                    while idx == t + 1:
-                        idx = th.randint(0, T, (1,)).item()
-                    neg_indices.append(idx)
-                g_neg = th.stack([g_all[i] for i in neg_indices], dim=1)  # [B, K, D]
-
-                # Per-agent InfoNCE loss: [B, n_agents]
-                loss_t = self.dynamics_predictor(h_i, g_pos, g_neg)
-                all_per_agent_loss.append(loss_t)
-
-            # Stack: [T-1, B, n_agents] → [B, T-1, n_agents]
-            all_per_agent_loss = th.stack(all_per_agent_loss, dim=0).permute(1, 0, 2)
-
-            # Masked average across time: [B, n_agents]
-            mask_expanded = mask_squeezed.unsqueeze(-1)  # [B, T-1, 1]
-            denom = mask_expanded.sum(dim=1).clamp(min=1.0)  # [B, 1]
-            per_agent_loss = (all_per_agent_loss * mask_expanded).sum(dim=1) / denom  # [B, n_agents]
-
-            # Overall InfoNCE loss for backward (mean across batch and agents)
-            infonce_loss = per_agent_loss.mean()
-            infonce_error = infonce_loss.item()
-
-            # Per-agent coordination signal: normalized to [0, 1]
-            max_infonce = math.log(K + 1)
-            coord_signal_batch = (per_agent_loss.mean(dim=0) / max_infonce).clamp(0.0, 1.0)
-            # coord_signal_batch: [n_agents] — per-agent, 0=coordinated, 1=random
-
-            # EMA smooth per-agent signals
-            tau = self.coord_signal_ema_tau
-            cs = self._get_coord_signals(current_batch.device)
-            self._coord_signals = tau * cs + (1.0 - tau) * coord_signal_batch.detach()
-            coord_signal_mean = self._coord_signals.mean().item()
-
-            # Also update scalar alpha_factor for logging
-            self.alpha_factor = (
-                self.alpha_factor_min
-                + (self.alpha_factor_max - self.alpha_factor_min) * coord_signal_mean
+            # TD(λ) with entropy bonus
+            targets = build_td_lambda_targets(
+                rewards, terminated, mask,
+                target_qvals, self.n_agents,
+                self.args.gamma, self.args.td_lambda,
+                target_entropy=target_entropy * self.entropy_coef,
             )
 
         # ═══════════════════════════════════════════════════════
-        # 7. CL distillation on memory portion ONLY
+        # 3. Mix chosen Q through VDN sum
         # ═══════════════════════════════════════════════════════
-        cl_loss = th.tensor(0.0, device=current_batch.device)
-        if self.cl_enabled and self.cl_distill_weight > 0 and memory_batch is not None:
-            cl_loss = self._compute_cl_distillation(memory_batch)
-            td_loss = td_loss + self.cl_distill_weight * cl_loss
+        chosen_aq_clone = chosen_action_qvals.clone().detach()
+        chosen_action_qvals_mixed = self.mixer(
+            chosen_action_qvals, states[:, :-1]
+        )
 
         # ═══════════════════════════════════════════════════════
-        # 8. Two separate backward passes (gradient isolation)
-        #    Pass 1: LGDD predictor only (detached inputs → no encoder grads)
-        #    Pass 2: Encoder + mixer + Q-head (TD + CL)
+        # 4. TD loss (standard MSE, for logging)
         # ═══════════════════════════════════════════════════════
+        td_error = chosen_action_qvals_mixed - targets.detach()
+        td_error_sq = 0.5 * td_error.pow(2)
+        mask_exp = mask.expand_as(td_error_sq)
+        masked_td_error = td_error_sq * mask_exp
+        L_td = masked_td_error.sum() / mask_exp.sum()
 
-        # Pass 1: InfoNCE predictor update (independent computation graph)
-        if self.lgdd_enabled and self.lgdd_optimizer is not None:
-            self.lgdd_optimizer.zero_grad()
-            infonce_loss.backward()
-            th.nn.utils.clip_grad_norm_(self.dynamics_params, self.args.grad_norm_clip)
-            self.lgdd_optimizer.step()
+        # ═══════════════════════════════════════════════════════
+        # 5. Beta loss: keeps func_f ≈ identity
+        # ═══════════════════════════════════════════════════════
+        affine_aq = self.mixer.func_f(
+            chosen_aq_clone, states[:, :-1], t_env
+        )
+        approx_error = chosen_action_qvals_mixed.detach() - affine_aq.sum(-1, keepdim=True)
+        beta_error = 0.5 * approx_error.pow(2)
+        masked_beta_error = beta_error * mask_exp
+        L_beta = masked_beta_error.sum() / mask_exp.sum()
 
-        # Pass 2: Main network update (encoder + mixer)
+        # ═══════════════════════════════════════════════════════
+        # 6. Weighted TD loss (asymmetric consistency mask)
+        # ═══════════════════════════════════════════════════════
+        gopt_mask = (
+            ((approx_error > 0.0).float() + (td_error < 0.0).float()) != 1
+        ).float()
+        weight_td = masked_td_error * gopt_mask * 0.5 + masked_td_error * (1 - gopt_mask)
+        mask_sum = mask_exp * gopt_mask * 0.5 + mask_exp * (1 - gopt_mask)
+        L_wtd = weight_td.sum() / mask_sum.sum()
+
+        loss = L_wtd + L_beta
+
+        # ═══════════════════════════════════════════════════════
+        # 7. Backward + optimise
+        # ═══════════════════════════════════════════════════════
         self.main_optimizer.zero_grad()
-        td_loss.backward()
+        loss.backward()
         grad_norm = th.nn.utils.clip_grad_norm_(self.main_params, self.args.grad_norm_clip)
         self.main_optimizer.step()
 
         # ═══════════════════════════════════════════════════════
-        # 9. Target network updates
+        # 8. Target network updates
         # ═══════════════════════════════════════════════════════
         tau = self.args.target_update_interval_or_tau
         if tau > 1:
@@ -451,76 +243,41 @@ class CASVDLearner:
         else:
             self._update_targets_soft(tau)
 
-        # Teacher MAC EMA update (for CL distillation)
         if self.cl_teacher_mac is not None:
             self._update_teacher_mac()
 
         # ═══════════════════════════════════════════════════════
-        # 10. Logging
+        # 9. Logging
         # ═══════════════════════════════════════════════════════
         if t_env - self.log_stats_t >= self.args.learner_log_interval:
-            agent_q_taken_mean = (agent_chosen_qvals * mask).sum().item() / (mask.sum().item() * self.n_agents)
-            agent_q_mean = mac_out.mean().item()
-            agent_q_std = mac_out.std().item()
-            agent_q_max_abs = mac_out.abs().max().item()
-            self.logger.log_stat("loss", td_loss.item(), t_env)
+            mask_elems = mask_exp.sum().item()
+            self.logger.log_stat("loss", loss.item(), t_env)
+            self.logger.log_stat("loss_td", L_td.item(), t_env)
+            self.logger.log_stat("loss_wtd", L_wtd.item(), t_env)
+            self.logger.log_stat("loss_beta", L_beta.item(), t_env)
             self.logger.log_stat(
                 "grad_norm",
                 grad_norm.item() if hasattr(grad_norm, "item") else grad_norm,
                 t_env,
             )
-            self.logger.log_stat("agent_q_taken_mean", agent_q_taken_mean, t_env)
-            self.logger.log_stat("agent_q_mean", agent_q_mean, t_env)
-            self.logger.log_stat("agent_q_std", agent_q_std, t_env)
-            self.logger.log_stat("agent_q_max_abs", agent_q_max_abs, t_env)
+            self.logger.log_stat("agent_q_mean", mac_out.mean().item(), t_env)
+            self.logger.log_stat("agent_q_std", mac_out.std().item(), t_env)
+            self.logger.log_stat("agent_q_max_abs", mac_out.abs().max().item(), t_env)
             self.logger.log_stat(
                 "q_taken_mean",
-                (chosen_action_qvals * mask).sum().item() / mask.sum().item(),
+                (chosen_action_qvals_mixed * mask_exp).sum().item() / mask_elems,
                 t_env,
             )
             self.logger.log_stat(
                 "target_mean",
-                (targets * mask).sum().item() / mask.sum().item(),
+                (targets * mask_exp).sum().item() / mask_elems,
                 t_env,
             )
-            if self.use_soft_values:
-                # Option B: fixed α (entropy_coef), no q-spread, no adaptive factor.
-                # `alpha_factor` / `q_spread_mean` are legacy log keys kept at
-                # zero so downstream log parsers don't break.
-                self.logger.log_stat("entropy_coef", float(self.entropy_coef), t_env)
-                self.logger.log_stat("alpha_mean", alpha_mean_for_log, t_env)
-                self.logger.log_stat("alpha_factor", 0.0, t_env)
-                self.logger.log_stat("q_spread_mean", q_spread_mean_for_log, t_env)
-                self.logger.log_stat("entropy_mean", entropy_mean_for_log, t_env)
-            if self.lgdd_enabled:
-                self.logger.log_stat("infonce_loss", infonce_loss.item(), t_env)
-                self.logger.log_stat("coord_signal_mean", coord_signal_mean, t_env)
-                if self._coord_signals is not None:
-                    self.logger.log_stat("coord_signal_std", self._coord_signals.std().item(), t_env)
-
-                # ── Local GAT embedding stats ──────────────────────────
-                self.logger.log_stat("local_emb_mean",      local_emb_mean,      t_env)
-                self.logger.log_stat("local_emb_std",       local_emb_std,       t_env)
-                self.logger.log_stat("local_emb_min",       local_emb_min,       t_env)
-                self.logger.log_stat("local_emb_max",       local_emb_max,       t_env)
-                self.logger.log_stat("local_emb_norm_mean", local_emb_norm_mean, t_env)
-                self.logger.log_stat("local_emb_dead_frac", local_emb_dead_frac, t_env)
-
-                # ── Team GAT embedding stats ───────────────────────────
-                self.logger.log_stat("team_emb_mean",       team_emb_mean,       t_env)
-                self.logger.log_stat("team_emb_std",        team_emb_std,        t_env)
-                self.logger.log_stat("team_emb_min",        team_emb_min,        t_env)
-                self.logger.log_stat("team_emb_max",        team_emb_max,        t_env)
-                self.logger.log_stat("team_emb_norm_mean",  team_emb_norm_mean,  t_env)
-
-                # ── Global team embedding stats (mean-pooled local) ────
-                self.logger.log_stat("global_emb_mean",     global_emb_mean,     t_env)
-                self.logger.log_stat("global_emb_std",      global_emb_std,      t_env)
-                self.logger.log_stat("global_emb_min",      global_emb_min,      t_env)
-                self.logger.log_stat("global_emb_max",      global_emb_max,      t_env)
-                self.logger.log_stat("global_emb_norm_mean",global_emb_norm_mean,t_env)
-            if self.cl_enabled and self.cl_distill_weight > 0:
-                self.logger.log_stat("cl_distill_loss", cl_loss.item(), t_env)
+            self.logger.log_stat("entropy", target_entropy.mean().item(), t_env)
+            self.logger.log_stat("entropy_coef", self.entropy_coef, t_env)
+            self.logger.log_stat(
+                "err_mask", (mask_sum.sum() / mask_exp.sum()).item(), t_env
+            )
             self.log_stats_t = t_env
 
     # ═══════════════════════════════════════════════════════════

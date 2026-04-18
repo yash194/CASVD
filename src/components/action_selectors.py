@@ -180,6 +180,45 @@ class BoltzmannActionSelector():
 REGISTRY["boltzmann"] = BoltzmannActionSelector
 
 
+class SoftPolicyActionSelector():
+    """Soft-QMIX action selection: softmax(func_f(func_g(Q)) / α) sampling.
+
+    During training: applies mixer's func_g and func_f to raw Q-values,
+    then samples from the Boltzmann soft policy.
+    During test: greedy argmax on raw Q-values (no transformations).
+    """
+
+    def __init__(self, args):
+        self.args = args
+        self.entropy_coef = getattr(args, "entropy_coef", 0.03)
+
+    def select_action(self, agent_inputs, avail_actions, t_env, test_mode=False,
+                       mixer=None, states=None):
+        if test_mode:
+            masked_q = agent_inputs.clone()
+            masked_q[avail_actions == 0] = -float("inf")
+            picked_actions = masked_q.max(dim=2)[1]
+            return picked_actions
+
+        q = agent_inputs
+        if mixer is not None and states is not None:
+            q = mixer.func_g(q, states, t_env).detach()
+            q = mixer.func_f(q, states, t_env).detach()
+
+        logits = q / self.entropy_coef
+        logits[avail_actions == 0] = -float("inf")
+        probs = th.softmax(logits, dim=-1)
+
+        cdf = th.cumsum(probs, dim=-1)
+        rand_idx = th.rand(probs[:, :, :1].shape, device=probs.device)
+        rand_idx = th.clamp(rand_idx, 1e-6, 1 - 1e-6)
+        picked_actions = th.searchsorted(cdf, rand_idx)
+        return picked_actions.squeeze(-1)
+
+
+REGISTRY["soft_policy"] = SoftPolicyActionSelector
+
+
 class GaussianActionSelector():
 
     def __init__(self, args):

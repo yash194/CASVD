@@ -20,12 +20,26 @@ class CASVDMAC:
         self.agent = agent_REGISTRY[self.args.agent](input_shape, self.args)
         self.action_selector = action_REGISTRY[args.action_selector](args)
         self.hidden_states = None
+        self.mixer = None
+
+    def set_mixer(self, mixer):
+        """Called by the learner to provide the mixer for soft-policy rollout."""
+        self.mixer = mixer
 
     def select_actions(self, ep_batch, t_ep, t_env=0, bs=slice(None), test_mode=False):
         avail_actions = ep_batch["avail_actions"][:, t_ep]
         agent_outputs = self.forward(ep_batch, t_ep, test_mode=test_mode)
+        # SoftPolicyActionSelector needs mixer + states for func_g/func_f.
+        # Standard selectors (epsilon_greedy, etc.) don't — pass only if
+        # the selector accepts them to stay backward-compatible.
+        if self.mixer is not None and hasattr(self.action_selector, "entropy_coef"):
+            states = ep_batch["state"][:, t_ep]
+            return self.action_selector.select_action(
+                agent_outputs[bs], avail_actions[bs], t_env, test_mode=test_mode,
+                mixer=self.mixer, states=states[bs],
+            )
         return self.action_selector.select_action(
-            agent_outputs[bs], avail_actions[bs], t_env, test_mode=test_mode
+            agent_outputs[bs], avail_actions[bs], t_env, test_mode=test_mode,
         )
 
     def forward(self, ep_batch, t, test_mode=False):

@@ -1,7 +1,9 @@
-# ─── CASVD: Coordination-Aware Soft Value Decomposition ───
+# ─── CASVD: GAT encoder + Soft-QMIX backbone ───
 
-# ── Action selection for rollout ──────────────────────────────
-action_selector: "epsilon_greedy"
+# ── Action selection ─────────────────────────────────────────
+# Training: softmax(func_f(func_g(Q)) / α) sampling (soft policy)
+# Test: greedy argmax on raw Q
+action_selector: "soft_policy"
 epsilon_start: 1.0
 epsilon_finish: 0.05
 epsilon_anneal_time: 100000
@@ -28,7 +30,10 @@ agent: "gat_ns"
 agent_output_type: "q"
 learner: "casvd_learner"
 
-# Mixer
+# ── Soft-QMIX mixer: VDN + func_f + func_g ──────────────────
+# VDN (sum) for mixing — no QMIX amplification of entropy bonus.
+# func_g: order-preserving residual (shapes Q landscape per agent).
+# func_f: affine per-agent (learned per-state temperature).
 mixer: "qmix"
 mixing_embed_dim: 32
 hypernet_embed: 64
@@ -49,7 +54,7 @@ q_head_gain: 0.1
 
 # TD learning
 gamma: 0.99
-td_lambda: 0.6
+td_lambda: 0.4
 
 # Gradient clipping
 grad_norm_clip: 10
@@ -58,43 +63,17 @@ grad_norm_clip: 10
 standardise_returns: False
 standardise_rewards: False
 
-# ── Option B: Soft Bellman backup via logsumexp ──────────────
-# V_soft(s,i) = entropy_coef · log Σ_a exp(Q_target(s,i,a) / entropy_coef)
-#             = E_π[Q_target] + entropy_coef · H(π)
-#
-# Proper entropy-regularised soft value: V_soft ≥ max_a Q_target by α·H(π).
-# Replaces the previous broken E_π[Q_target] form which was strictly ≤ max.
-# The q-spread-relative adaptive machinery is gone — it was scale-invariant,
-# not exploration-when-uncertain, and pinned α at the floor in practice.
-#
-# Tune entropy_coef in [0.05, 0.2].  Larger = softer targets / more
-# exploration pressure.  Watch entropy_mean in the logs:
-#   entropy ≈ 0     → α too small, acting like hard-max
-#   entropy ≈ log|A_avail| → α too large, policy is ~uniform
-#   entropy ≈ 0.3–0.7 × log|A_avail| → sweet spot
-use_soft_values: True
-entropy_coef: 0.1
+# ── Soft-QMIX entropy coefficient ───────────────────────────
+# α = 0.03 (matches Soft-QMIX paper).  With VDN mixer the entropy
+# bonus is amplified by exactly n_agents (predictable), so 0.03 is
+# safe — unlike QMIX where the nonlinear mixer amplified it ~30×.
+entropy_coef: 0.03
 
-# ── Disabled for Option B baseline test ──────────────────────
-# InfoNCE predictor + dual backward pass + per-agent adaptive α are all
-# turned off so the logsumexp fix is validated in isolation.  Re-enable
-# after confirming the soft-value backbone is healthy.
+# ── Components 3 & 4 disabled for baseline test ──────────────
 lgdd_enabled: False
 use_adaptive_alpha: False
 
-# ── Legacy (Option A) hyperparams — inert when the flags above are False.
-# Kept here for one-line revival later:
-#   alpha_factor_init: 0.3
-#   alpha_factor_min: 0.0
-#   alpha_factor_max: 0.3
-#   alpha_floor: 0.005
-#   soft_value_warmup_steps: 0
-#   lgdd_lr: 0.0003
-#   infonce_n_negatives: 15
-#   infonce_temperature: 0.1
-#   coord_signal_ema_tau: 0.999
-
-# ── Continual learning ────────────────────────────────────────
+# ── Continual learning (off) ─────────────────────────────────
 cl_enabled: False
 cl_memory_buffer_size: 10000
 cl_current_ratio: 0.8
@@ -103,7 +82,6 @@ cl_teacher_ema_tau: 0.002
 cl_distill_weight: 0.05
 cl_temperature: 0.1
 
-# Disable features not needed
 store_agent_types: False
 
 name: "casvd"
