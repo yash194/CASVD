@@ -46,7 +46,11 @@ class CASVDLearner:
         # ── Per-agent adaptive alpha (off by default) ──
         self.use_adaptive_alpha = getattr(args, "use_adaptive_alpha", False)
         self._coord_signals = None
-        self.coord_signal_ema_tau = getattr(args, "coord_signal_ema_tau", 0.99)
+        self._coord_warmup = True   # first batch seeds directly, no EMA blending
+        # τ = 0.95 → time constant ~20 training steps ≈ 0.2 % of a 10 M-step run.
+        # Fast enough that early-training coordination changes actually move the
+        # signal; slow enough that per-batch sampling noise averages out.
+        self.coord_signal_ema_tau = getattr(args, "coord_signal_ema_tau", 0.95)
 
         # ── InfoNCE coordination sensor (off by default) ──
         self.lgdd_enabled = getattr(args, "lgdd_enabled", False)
@@ -103,6 +107,136 @@ class CASVDLearner:
             self._coord_signals = self._coord_signals.to(device)
         return self._coord_signals
 
+    def _compute_infonce(self, all_hidden, mask, device):
+        """Per-agent InfoNCE coordination signal with cross-episode negatives.
+
+        The positive sample for agent i at time t is `g_others_i[t+1]`,
+        the mean of OTHER agents' hidden states at the next timestep in
+        the SAME episode (asymmetric — breaks encoder symmetry).
+
+        The K negative samples are drawn from OTHER episodes in the
+        batch.  This is the fix for the "same-episode negative" bug:
+        if negatives come from other timesteps of the same episode,
+        they share team composition, start positions, and temporally-
+        correlated game state, so the predictor collapses to a trivial
+        timestamp classifier.  With cross-episode negatives the task
+        is "which next-state belongs to my battle" — only genuine
+        coordination features can solve it.
+
+        Args:
+            all_hidden: list of [B, n_agents, D] hidden tensors, length T.
+            mask:       [B, T-1, 1] valid-timestep mask.
+            device:     target device.
+
+        Returns:
+            infonce_loss:       scalar, mean InfoNCE loss for backward.
+            coord_signal_batch: [n_agents] normalised per-agent signal.
+            per_agent_loss:     [B, n_agents] time-masked per-agent loss.
+        """
+        all_h = th.stack(all_hidden, dim=0)           # [T, B, N, D]
+        T_size, B_size, N, D = all_h.shape
+        K = self.infonce_n_negatives
+
+        # Per-agent positive: mean of OTHER agents' hidden states at t+1
+        if N > 1:
+            team_sum = all_h.sum(dim=2, keepdim=True)       # [T, B, 1, D]
+            g_others = (team_sum - all_h) / (N - 1)         # [T, B, N, D]
+        else:
+            g_others = all_h                                # degenerate
+
+        # Global team mean (for sampling negatives across the batch)
+        g_all = all_h.mean(dim=2)                           # [T, B, D]
+
+        # ── Cross-episode negative sampling (FIX for Problem 1) ─────
+        # For every positive at (b, t+1), sample K negatives as
+        # (b', t') pairs with b' ≠ b.  Guarantees temporal-shortcut
+        # features (elapsed time, cumulative damage, dead-unit count)
+        # cannot solve the task — the predictor MUST rely on
+        # coordination-relevant features to distinguish the true
+        # next-state from B−1 alternative battles' states.
+        if B_size >= 2:
+            shifts = th.randint(1, B_size, (T_size - 1, B_size, K), device=device)
+        else:
+            # Degenerate: batch size 1.  Should not happen in normal
+            # training (batch_size=128 in the config).
+            shifts = th.zeros((T_size - 1, B_size, K), dtype=th.long, device=device)
+        neg_t = th.randint(0, T_size, (T_size - 1, B_size, K), device=device)
+        b_arange = th.arange(B_size, device=device).view(1, B_size, 1)
+        neg_b = (b_arange + shifts) % B_size                # [T-1, B, K], ≠ b
+
+        # Gather: g_all[neg_t[τ,b,k], neg_b[τ,b,k]]  →  [T-1, B, K, D]
+        g_neg_all = g_all[neg_t, neg_b]
+
+        # ── Vectorised predictor call ────────────────────────────
+        # Flatten (T-1) and B into one big batch dim for a single call.
+        h_i_all   = all_h[:T_size - 1]                      # [T-1, B, N, D]
+        g_pos_all = g_others[1:T_size]                      # [T-1, B, N, D]
+
+        h_i_flat   = h_i_all.reshape(-1, N, D)              # [(T-1)*B, N, D]
+        g_pos_flat = g_pos_all.reshape(-1, N, D)            # [(T-1)*B, N, D]
+        g_neg_flat = g_neg_all.reshape(-1, K, D)            # [(T-1)*B, K, D]
+
+        loss_flat, pred_stats = self.dynamics_predictor(
+            h_i_flat, g_pos_flat, g_neg_flat, return_stats=True
+        )                                                    # [(T-1)*B, N], dict
+
+        all_per_agent_loss = loss_flat.reshape(
+            T_size - 1, B_size, N
+        ).permute(1, 0, 2)                                   # [B, T-1, N]
+
+        # Masked time-average → [B, N]
+        mask_sq  = mask.squeeze(-1)                          # [B, T-1]
+        mask_exp = mask_sq.unsqueeze(-1)                     # [B, T-1, 1]
+        denom    = mask_exp.sum(dim=1).clamp(min=1.0)
+        per_agent_loss = (all_per_agent_loss * mask_exp).sum(dim=1) / denom
+
+        # Scalar loss for backward (mean over B and N)
+        infonce_loss = per_agent_loss.mean()
+
+        # Per-agent coordination signal in [0, 1]
+        max_infonce = math.log(K + 1)
+        coord_signal_batch = (
+            per_agent_loss.mean(dim=0) / max_infonce
+        ).clamp(0.0, 1.0)
+
+        # ── Additional diagnostic stats ──────────────────────────
+        # Captured once per train() call; cheap to compute.
+        with th.no_grad():
+            # Cross-agent hidden-state diversity (per-timestep std across agents).
+            # Low value → clustered formation (h_i's all similar).
+            # High value → dispersed/flanking formation (h_i's diverge).
+            h_diversity = all_h.std(dim=2).mean().item()
+
+            # Raw cosine similarity of h_i and g_pos BEFORE predictor projection.
+            # If already high, predictor can succeed via W ≈ identity → task trivial.
+            h_norm = F.normalize(h_i_all, dim=-1)
+            g_norm = F.normalize(g_pos_all, dim=-1)
+            raw_cos_sim = (h_norm * g_norm).sum(-1).mean().item()
+
+            # Loss distribution percentiles — shows if most samples are easy
+            # (loss near 0) or if there's real variance.
+            flat_loss = all_per_agent_loss.reshape(-1)
+            q = th.quantile(
+                flat_loss, th.tensor([0.1, 0.5, 0.9], device=flat_loss.device)
+            )
+            loss_p10, loss_p50, loss_p90 = q[0].item(), q[1].item(), q[2].item()
+
+        diag = {
+            "h_diversity":   h_diversity,
+            "raw_cos_sim":   raw_cos_sim,
+            "loss_p10":      loss_p10,
+            "loss_median":   loss_p50,
+            "loss_p90":      loss_p90,
+            "top1_acc":      pred_stats["top1_acc_per_agent"].mean().item(),
+            "top1_per_agent": pred_stats["top1_acc_per_agent"],       # [N]
+            "pos_score":     pred_stats["pos_score_mean"],
+            "neg_score":     pred_stats["neg_score_mean"],
+            "margin":        pred_stats["margin_mean"],
+            "per_agent_loss_mean": per_agent_loss.mean(dim=0),          # [N]
+        }
+
+        return infonce_loss, coord_signal_batch, per_agent_loss, diag
+
     def train(self, batch, t_env, episode_num, current_batch_size=None, memory_batch_size=0):
         # ── Split batch for CL ──
         actual_current = current_batch_size if current_batch_size is not None else batch.batch_size
@@ -126,9 +260,13 @@ class CASVDLearner:
         # ═══════════════════════════════════════════════════════
         self.mac.init_hidden(current_batch.batch_size)
         mac_out = []
+        all_hidden = [] if self.lgdd_enabled else None
         for t in range(current_batch.max_seq_length):
             q_values = self.mac.forward(current_batch, t)
             mac_out.append(q_values)
+            if self.lgdd_enabled:
+                # Detached clone → InfoNCE gradient never flows into encoder.
+                all_hidden.append(self.mac.hidden_states.detach().clone())
         mac_out = th.stack(mac_out, dim=1)
         mac_out = self.mixer.func_g(mac_out, states, t_env)
 
@@ -225,7 +363,47 @@ class CASVDLearner:
         loss = L_wtd + L_beta
 
         # ═══════════════════════════════════════════════════════
-        # 7. Backward + optimise
+        # 7a. InfoNCE coordination signal (gradient-isolated)
+        #     Uses CROSS-EPISODE negatives (fix for same-episode
+        #     temporal-shortcut bug).  Only the predictor MLP is
+        #     updated — hidden states are detached, so no gradient
+        #     flows into the encoder/mixer.
+        # ═══════════════════════════════════════════════════════
+        infonce_loss = None
+        coord_signal_mean = 0.0
+        infonce_diag = None
+        if self.lgdd_enabled and self.dynamics_predictor is not None:
+            infonce_loss, coord_signal_batch, _, infonce_diag = self._compute_infonce(
+                all_hidden, mask, current_batch.device
+            )
+            # Warm-start: on the very first batch, seed coord_signals directly
+            # from the measured values instead of blending with the ones()
+            # initialisation.  Without this, τ=0.95 means the first 60-100
+            # batches are still dominated by the prior (~1.0), wasting the
+            # early-training window where coordination is changing fastest.
+            _ = self._get_coord_signals(current_batch.device)  # lazy-init buffer
+            if self._coord_warmup:
+                self._coord_signals = coord_signal_batch.detach().clone()
+                self._coord_warmup = False
+            else:
+                tau = self.coord_signal_ema_tau
+                self._coord_signals = (
+                    tau * self._coord_signals
+                    + (1.0 - tau) * coord_signal_batch.detach()
+                )
+            coord_signal_mean = self._coord_signals.mean().item()
+
+        # ═══════════════════════════════════════════════════════
+        # 7b. InfoNCE backward (separate optimiser, isolated graph)
+        # ═══════════════════════════════════════════════════════
+        if infonce_loss is not None and self.lgdd_optimizer is not None:
+            self.lgdd_optimizer.zero_grad()
+            infonce_loss.backward()
+            th.nn.utils.clip_grad_norm_(self.dynamics_params, self.args.grad_norm_clip)
+            self.lgdd_optimizer.step()
+
+        # ═══════════════════════════════════════════════════════
+        # 7c. Main network backward + optimise
         # ═══════════════════════════════════════════════════════
         self.main_optimizer.zero_grad()
         loss.backward()
@@ -278,6 +456,94 @@ class CASVDLearner:
             self.logger.log_stat(
                 "err_mask", (mask_sum.sum() / mask_exp.sum()).item(), t_env
             )
+            if self.lgdd_enabled and infonce_loss is not None:
+                # ── Loss & signal stats ──────────────────────────
+                self.logger.log_stat("infonce_loss", infonce_loss.item(), t_env)
+                self.logger.log_stat("coord_signal_mean", coord_signal_mean, t_env)
+                if self._coord_signals is not None:
+                    self.logger.log_stat(
+                        "coord_signal_std",
+                        self._coord_signals.std().item(),
+                        t_env,
+                    )
+                    self.logger.log_stat(
+                        "coord_signal_min",
+                        self._coord_signals.min().item(),
+                        t_env,
+                    )
+                    self.logger.log_stat(
+                        "coord_signal_max",
+                        self._coord_signals.max().item(),
+                        t_env,
+                    )
+                    # Per-agent coord signals → see if agents actually differ
+                    for i in range(self.n_agents):
+                        self.logger.log_stat(
+                            f"coord_signal_agent_{i}",
+                            self._coord_signals[i].item(),
+                            t_env,
+                        )
+
+                if infonce_diag is not None:
+                    # ── Task difficulty diagnostics ─────────────────
+                    #   raw_cos_sim : cosine(h_i, g_pos) without predictor
+                    #                 projection. If >0.5, task is trivially
+                    #                 solved via W ≈ identity (bad — means
+                    #                 coord_signal is measuring self-similarity).
+                    #   top1_acc    : fraction of samples where the predictor
+                    #                 ranks the positive above all K negatives.
+                    #                 Random = 1/(K+1) = 0.0625.  Target: 0.3-0.8.
+                    #                 Near 1.0 = task too easy; near 0.06 = too hard.
+                    #   margin      : pos_score - max_neg_score (after τ-unscaling).
+                    #                 Large positive = predictor very confident;
+                    #                 near zero = predictor struggling.
+                    self.logger.log_stat(
+                        "infonce_raw_cos_sim", infonce_diag["raw_cos_sim"], t_env
+                    )
+                    self.logger.log_stat(
+                        "infonce_top1_acc", infonce_diag["top1_acc"], t_env
+                    )
+                    self.logger.log_stat(
+                        "infonce_margin", infonce_diag["margin"], t_env
+                    )
+                    self.logger.log_stat(
+                        "infonce_pos_score", infonce_diag["pos_score"], t_env
+                    )
+                    self.logger.log_stat(
+                        "infonce_neg_score", infonce_diag["neg_score"], t_env
+                    )
+
+                    # ── Loss distribution (percentiles over all (b, t, i) samples)
+                    self.logger.log_stat(
+                        "infonce_loss_p10", infonce_diag["loss_p10"], t_env
+                    )
+                    self.logger.log_stat(
+                        "infonce_loss_median", infonce_diag["loss_median"], t_env
+                    )
+                    self.logger.log_stat(
+                        "infonce_loss_p90", infonce_diag["loss_p90"], t_env
+                    )
+
+                    # ── Formation proxy ─────────────────────────────
+                    # Cross-agent hidden-state std.  Low = clustered formation;
+                    # high = flanking/dispersed.  Correlate with coord_signal
+                    # across episodes to detect the Problem-3 formation bias.
+                    self.logger.log_stat(
+                        "h_diversity", infonce_diag["h_diversity"], t_env
+                    )
+
+                    # ── Per-agent InfoNCE loss and top-1 accuracy ───
+                    for i in range(self.n_agents):
+                        self.logger.log_stat(
+                            f"infonce_loss_agent_{i}",
+                            infonce_diag["per_agent_loss_mean"][i].item(),
+                            t_env,
+                        )
+                        self.logger.log_stat(
+                            f"infonce_top1_agent_{i}",
+                            infonce_diag["top1_per_agent"][i].item(),
+                            t_env,
+                        )
             self.log_stats_t = t_env
 
     # ═══════════════════════════════════════════════════════════

@@ -50,7 +50,7 @@ class InfoNCEPredictor(nn.Module):
         nn.init.zeros_(self.W[0].bias)
         nn.init.orthogonal_(self.W[2].weight)
 
-    def forward(self, h_i, g_pos, g_neg):
+    def forward(self, h_i, g_pos, g_neg, return_stats=False):
         """Compute per-agent InfoNCE loss.
 
         Args:
@@ -60,10 +60,18 @@ class InfoNCEPredictor(nn.Module):
                    Shape: [B, n_agents, hidden_dim]  (one distinct target per agent)
             g_neg: Shared negatives — global team mean at K random timesteps.
                    Shape: [B, K, hidden_dim]
+            return_stats: if True, also return a dict of diagnostic stats.
 
         Returns:
             loss_per_agent: InfoNCE loss per agent, shape [B, n_agents].
                             Range: [0, log(K+1)].  Lower = better coordination.
+            stats (optional, only if return_stats=True):
+                "top1_acc_per_agent": [n_agents], fraction of samples where the
+                                       positive score > all K negatives.
+                "pos_score_mean":     scalar, mean positive cosine×1/τ.
+                "neg_score_mean":     scalar, mean negative cosine×1/τ.
+                "margin_mean":        scalar, mean (pos − max_neg).  Large positive
+                                       means the task is easy; near zero means hard.
         """
         B, n_agents, D = h_i.shape
         K = g_neg.shape[1]
@@ -91,5 +99,19 @@ class InfoNCEPredictor(nn.Module):
             labels.reshape(B * n_agents),
             reduction="none",
         ).reshape(B, n_agents)
+
+        if return_stats:
+            with th.no_grad():
+                top1 = (logits.argmax(dim=-1) == 0).float()   # [B, n_agents]
+                top1_per_agent = top1.mean(dim=0)              # [n_agents]
+                max_neg = score_neg.max(dim=-1).values         # [B, n_agents]
+                margin = (score_pos - max_neg).mean().item() * self.temperature
+                stats = {
+                    "top1_acc_per_agent": top1_per_agent.detach(),
+                    "pos_score_mean": (score_pos.mean().item() * self.temperature),
+                    "neg_score_mean": (score_neg.mean().item() * self.temperature),
+                    "margin_mean":    margin,
+                }
+            return loss_per_agent, stats
 
         return loss_per_agent
