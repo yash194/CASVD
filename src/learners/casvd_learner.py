@@ -107,86 +107,135 @@ class CASVDLearner:
             self._coord_signals = self._coord_signals.to(device)
         return self._coord_signals
 
-    def _compute_infonce(self, all_hidden, mask, device):
-        """Per-agent InfoNCE coordination signal with cross-episode negatives.
+    def _compute_infonce(self, all_hidden, mask, device,
+                          all_local=None, all_team=None):
+        """Per-agent InfoNCE coord signal — Stage B (pre-TeamGAT signals).
 
-        The positive sample for agent i at time t is `g_others_i[t+1]`,
-        the mean of OTHER agents' hidden states at the next timestep in
-        the SAME episode (asymmetric — breaks encoder symmetry).
+        Stage B of the UPMI fix:  both predictor INPUT and TARGET are
+        taken from local_summary (pre-TeamGAT), not the post-GAT hidden
+        state.  Empirically, `delta_local_cross_agent_cos ≈ 0.04`
+        (~orthogonal) while `delta_h_cross_agent_cos ≈ 0.46` — TeamGAT
+        is the homogeniser, and pre-TeamGAT deltas are the per-agent
+        signal the adaptive-α pipeline needs.
 
-        The K negative samples are drawn from OTHER episodes in the
-        batch.  This is the fix for the "same-episode negative" bug:
-        if negatives come from other timesteps of the same episode,
-        they share team composition, start positions, and temporally-
-        correlated game state, so the predictor collapses to a trivial
-        timestamp classifier.  With cross-episode negatives the task
-        is "which next-state belongs to my battle" — only genuine
-        coordination features can solve it.
+        Setup:
+            INPUT (to predictor):  local_summary_i(t)        cos~0.76
+            TARGET (positive):     Δlocal_summary_j(t)       cos~0.04
+            NEGATIVE:              Δlocal_summary, cross-episode mean
+
+        Rationale (Stage A failure mode):  with post-GAT targets
+        `h_cross_agent_cos = 0.81`, the predictor's output W(h_i) is
+        nearly identical across agents regardless of pairwise vs mean
+        aggregation.  Per-pair variance existed (std 0.6) but the
+        per-agent aggregate was uniform (coord_signal_std ≈ 0.004).
+        Pre-TeamGAT signals break the shared-encoder symmetry at
+        BOTH the input and target sides.
+
+        Pairwise structure preserved from Stage A:  compute InfoNCE
+        separately for each (agent i → teammate j) pair, then mean
+        the LOSSES, keeping per-teammate variance from being washed
+        out by pre-cosine averaging.
 
         Args:
             all_hidden: list of [B, n_agents, D] hidden tensors, length T.
+                        Kept for backward-compat cross-agent diagnostics
+                        (h_cross_agent_cos), but NOT used for the loss.
             mask:       [B, T-1, 1] valid-timestep mask.
             device:     target device.
+            all_local:  list of [B, n_agents, D] pre-TeamGAT local_summary
+                        tensors (detached clones). REQUIRED for Stage B.
+            all_team:   list of [B, n_agents, D] post-TeamGAT team_summary.
+                        Diagnostic only.
 
         Returns:
             infonce_loss:       scalar, mean InfoNCE loss for backward.
             coord_signal_batch: [n_agents] normalised per-agent signal.
             per_agent_loss:     [B, n_agents] time-masked per-agent loss.
+            diag:               dict of diagnostic stats.
         """
-        all_h = th.stack(all_hidden, dim=0)           # [T, B, N, D]
-        T_size, B_size, N, D = all_h.shape
+        assert all_local is not None and len(all_local) > 0, (
+            "Stage B requires pre-TeamGAT local_summary — "
+            "train() must call forward_with_latents with lgdd_enabled."
+        )
+
+        # Stage B: PRIMARY tensor is now local_summary (pre-TeamGAT).
+        all_loc = th.stack(all_local, dim=0)            # [T, B, N, D]
+        T_size, B_size, N, D = all_loc.shape
         K = self.infonce_n_negatives
 
-        # Per-agent positive: mean of OTHER agents' hidden states at t+1
-        if N > 1:
-            team_sum = all_h.sum(dim=2, keepdim=True)       # [T, B, 1, D]
-            g_others = (team_sum - all_h) / (N - 1)         # [T, B, N, D]
-        else:
-            g_others = all_h                                # degenerate
+        # Keep all_h available for diagnostics only.
+        all_h = th.stack(all_hidden, dim=0)              # [T, B, N, D]
 
-        # Global team mean (for sampling negatives across the batch)
-        g_all = all_h.mean(dim=2)                           # [T, B, D]
+        # ── Δlocal_summary — the Stage B target ─────────────────────
+        # Δlocal_j(t) = local_summary_j(t+1) − local_summary_j(t).
+        # Empirical cross_agent_cos ≈ 0.04 (near-orthogonal) — the
+        # per-agent signal has been hiding here the whole time.
+        delta_loc = all_loc[1:] - all_loc[:-1]           # [T-1, B, N, D]
+        T_delta = T_size - 1
 
-        # ── Cross-episode negative sampling (FIX for Problem 1) ─────
-        # For every positive at (b, t+1), sample K negatives as
-        # (b', t') pairs with b' ≠ b.  Guarantees temporal-shortcut
-        # features (elapsed time, cumulative damage, dead-unit count)
-        # cannot solve the task — the predictor MUST rely on
-        # coordination-relevant features to distinguish the true
-        # next-state from B−1 alternative battles' states.
+        # Also compute Δh for comparison diagnostic only (not used in loss).
+        delta_h = all_h[1:] - all_h[:-1]                 # [T-1, B, N, D]
+
+        # Global team delta for cross-episode negatives (based on local).
+        g_all_delta = delta_loc.mean(dim=2)              # [T-1, B, D]
+
+        # Cross-episode negative sampling (same as before).
         if B_size >= 2:
-            shifts = th.randint(1, B_size, (T_size - 1, B_size, K), device=device)
+            shifts = th.randint(1, B_size, (T_delta, B_size, K), device=device)
         else:
-            # Degenerate: batch size 1.  Should not happen in normal
-            # training (batch_size=128 in the config).
-            shifts = th.zeros((T_size - 1, B_size, K), dtype=th.long, device=device)
-        neg_t = th.randint(0, T_size, (T_size - 1, B_size, K), device=device)
+            shifts = th.zeros((T_delta, B_size, K), dtype=th.long, device=device)
+        neg_t = th.randint(0, T_delta, (T_delta, B_size, K), device=device)
         b_arange = th.arange(B_size, device=device).view(1, B_size, 1)
-        neg_b = (b_arange + shifts) % B_size                # [T-1, B, K], ≠ b
+        neg_b = (b_arange + shifts) % B_size             # [T-1, B, K]
+        g_neg_all = g_all_delta[neg_t, neg_b]            # [T-1, B, K, D]
 
-        # Gather: g_all[neg_t[τ,b,k], neg_b[τ,b,k]]  →  [T-1, B, K, D]
-        g_neg_all = g_all[neg_t, neg_b]
+        # ── Per-teammate targets — from Δlocal ────────────────────
+        if N > 1:
+            teammate_idx = th.tensor(
+                [[j for j in range(N) if j != i] for i in range(N)],
+                dtype=th.long, device=device,
+            )                                            # [N, N-1]
+            teammate_deltas = delta_loc[:, :, teammate_idx]
+            # shape [T-1, B, N, N-1, D]:
+            # teammate_deltas[τ, b, i, k] = Δlocal_{teammate_idx[i,k]} at (τ,b)
+            n_teammates = N - 1
+        else:
+            teammate_deltas = delta_loc.unsqueeze(3)     # [T-1, B, N, 1, D]
+            n_teammates = 1
 
-        # ── Vectorised predictor call ────────────────────────────
-        # Flatten (T-1) and B into one big batch dim for a single call.
-        h_i_all   = all_h[:T_size - 1]                      # [T-1, B, N, D]
-        g_pos_all = g_others[1:T_size]                      # [T-1, B, N, D]
+        # ── Flatten (T-1, B) → F for the predictor ───────────────
+        # Predictor INPUT is local_summary_i(t) (NOT its delta).
+        F_dim = T_delta * B_size
+        h_i_all          = all_loc[:T_size - 1]          # [T-1, B, N, D]
+        h_i_flat         = h_i_all.reshape(F_dim, N, D)  # [F, N, D]
+        g_neg_flat       = g_neg_all.reshape(F_dim, K, D)
+        teammate_deltas_flat = teammate_deltas.reshape(
+            F_dim, N, n_teammates, D
+        )                                                # [F, N, N-1, D]
 
-        h_i_flat   = h_i_all.reshape(-1, N, D)              # [(T-1)*B, N, D]
-        g_pos_flat = g_pos_all.reshape(-1, N, D)            # [(T-1)*B, N, D]
-        g_neg_flat = g_neg_all.reshape(-1, K, D)            # [(T-1)*B, K, D]
+        # ── Pairwise InfoNCE: one loss per (i, k) teammate slot ───
+        # Loop over k=0..N-2.  Only 4 iterations for SMACv2 Protoss 5v5.
+        per_teammate_losses = []
+        per_teammate_stats  = []
+        for k in range(n_teammates):
+            g_pos_k = teammate_deltas_flat[:, :, k, :]       # [F, N, D]
+            loss_k, stats_k = self.dynamics_predictor(
+                h_i_flat, g_pos_k, g_neg_flat, return_stats=True
+            )                                                # [F, N]
+            per_teammate_losses.append(loss_k)
+            per_teammate_stats.append(stats_k)
 
-        loss_flat, pred_stats = self.dynamics_predictor(
-            h_i_flat, g_pos_flat, g_neg_flat, return_stats=True
-        )                                                    # [(T-1)*B, N], dict
+        per_pair_loss = th.stack(per_teammate_losses, dim=-1)  # [F, N, N-1]
+        # Average over teammate slots  →  per-(f, i) loss
+        loss_flat = per_pair_loss.mean(dim=-1)                 # [F, N]
 
         all_per_agent_loss = loss_flat.reshape(
-            T_size - 1, B_size, N
-        ).permute(1, 0, 2)                                   # [B, T-1, N]
+            T_delta, B_size, N
+        ).permute(1, 0, 2)                                     # [B, T-1, N]
 
         # Masked time-average → [B, N]
-        mask_sq  = mask.squeeze(-1)                          # [B, T-1]
-        mask_exp = mask_sq.unsqueeze(-1)                     # [B, T-1, 1]
+        mask_sq  = mask.squeeze(-1)                            # [B, T-1]
+        mask_exp = mask_sq.unsqueeze(-1)                       # [B, T-1, 1]
         denom    = mask_exp.sum(dim=1).clamp(min=1.0)
         per_agent_loss = (all_per_agent_loss * mask_exp).sum(dim=1) / denom
 
@@ -199,40 +248,121 @@ class CASVDLearner:
             per_agent_loss.mean(dim=0) / max_infonce
         ).clamp(0.0, 1.0)
 
-        # ── Additional diagnostic stats ──────────────────────────
-        # Captured once per train() call; cheap to compute.
+        # ── Diagnostic stats ─────────────────────────────────────
         with th.no_grad():
-            # Cross-agent hidden-state diversity (per-timestep std across agents).
-            # Low value → clustered formation (h_i's all similar).
-            # High value → dispersed/flanking formation (h_i's diverge).
-            h_diversity = all_h.std(dim=2).mean().item()
+            # Kept for comparison with previous runs (h-based stats):
+            h_diversity     = all_h.std(dim=2).mean().item()
+            delta_diversity = delta_h.std(dim=2).mean().item()
+            delta_norm_mean = delta_h.norm(dim=-1).mean().item()
 
-            # Raw cosine similarity of h_i and g_pos BEFORE predictor projection.
-            # If already high, predictor can succeed via W ≈ identity → task trivial.
-            h_norm = F.normalize(h_i_all, dim=-1)
-            g_norm = F.normalize(g_pos_all, dim=-1)
+            # NEW: Stage-B-specific diagnostics on the actual signal
+            # used by the predictor (local_summary and its delta).
+            local_diversity       = all_loc.std(dim=2).mean().item()
+            delta_local_diversity = delta_loc.std(dim=2).mean().item()
+            delta_local_norm_mean = delta_loc.norm(dim=-1).mean().item()
+
+            # ── Cross-agent cosine similarity (upstream diagnostic) ──
+            # Stage B uses local_summary as input and Δlocal as target,
+            # so `local_summary_cross_agent_cos` is now the INPUT-side
+            # alignment metric (not h) and `delta_local_cross_agent_cos`
+            # is the TARGET-side metric.  The h-based versions are kept
+            # for cross-comparison with the pre-Stage-B runs.
+            if N > 1:
+                n_off = N * (N - 1)
+
+                def _cross_agent_cos(x):
+                    """Mean of off-diagonal cos(x_i, x_j).  x: [T, B, N, D]."""
+                    x_n = F.normalize(x, dim=-1)
+                    mat = th.einsum("tbid,tbjd->tbij", x_n, x_n)
+                    off_sum = (
+                        mat.sum(dim=(-2, -1))
+                        - th.diagonal(mat, dim1=-2, dim2=-1).sum(dim=-1)
+                    )
+                    return (off_sum / n_off).mean().item()
+
+                h_cross_agent_cos             = _cross_agent_cos(all_h)
+                delta_cross_agent_cos         = _cross_agent_cos(delta_h)
+                local_summary_cross_agent_cos = _cross_agent_cos(all_loc)
+                delta_local_cross_agent_cos   = _cross_agent_cos(delta_loc)
+
+                if all_team is not None and len(all_team) > 0:
+                    all_team_stack = th.stack(all_team, dim=0)
+                    team_summary_cross_agent_cos = _cross_agent_cos(all_team_stack)
+                else:
+                    team_summary_cross_agent_cos = -1.0
+            else:
+                h_cross_agent_cos = 1.0
+                delta_cross_agent_cos = 1.0
+                local_summary_cross_agent_cos = 1.0
+                team_summary_cross_agent_cos = 1.0
+                delta_local_cross_agent_cos = 1.0
+
+            # raw_cos_sim: how close is local_summary_i to a representative
+            # teammate's Δlocal BEFORE the predictor projects?  If low, task
+            # is genuinely non-trivial.  Expected for Stage B: very low
+            # (~0), because local_summary (cos 0.76) and Δlocal (cos 0.04)
+            # live in roughly orthogonal parts of the embedding manifold.
+            if n_teammates > 0:
+                rep_target = teammate_deltas_flat[:, :, 0, :]  # [F, N, D]
+            else:
+                rep_target = h_i_flat
+            h_norm = F.normalize(h_i_flat, dim=-1)
+            g_norm = F.normalize(rep_target, dim=-1)
             raw_cos_sim = (h_norm * g_norm).sum(-1).mean().item()
 
-            # Loss distribution percentiles — shows if most samples are easy
-            # (loss near 0) or if there's real variance.
+            # NEW (Stage-A-specific): per-(F, i) std across teammate
+            # slots.  Directly measures whether different teammates are
+            # differently predictable from the same h_i — the *topology-
+            # dependent variance* the pairwise fix was meant to unlock.
+            # If this is near zero, the predictor outputs similar losses
+            # for all teammates → Component 3 of UPMI (identity cond.)
+            # may be needed.  If it's large, Stage A is working.
+            per_pair_std = per_pair_loss.std(dim=-1)            # [F, N]
+            per_pair_std_mean = per_pair_std.mean().item()
+            per_pair_std_per_agent = per_pair_std.mean(dim=0).detach()  # [N]
+
             flat_loss = all_per_agent_loss.reshape(-1)
             q = th.quantile(
                 flat_loss, th.tensor([0.1, 0.5, 0.9], device=flat_loss.device)
             )
             loss_p10, loss_p50, loss_p90 = q[0].item(), q[1].item(), q[2].item()
 
+        # Aggregate predictor stats across teammate slots
+        top1_stack = th.stack(
+            [s["top1_acc_per_agent"] for s in per_teammate_stats], dim=0
+        )                                                    # [N-1, N]
+        top1_per_agent_avg = top1_stack.mean(dim=0)          # [N]
+        pos_score_avg = sum(s["pos_score_mean"] for s in per_teammate_stats) / n_teammates
+        neg_score_avg = sum(s["neg_score_mean"] for s in per_teammate_stats) / n_teammates
+        margin_avg    = sum(s["margin_mean"]    for s in per_teammate_stats) / n_teammates
+
         diag = {
-            "h_diversity":   h_diversity,
-            "raw_cos_sim":   raw_cos_sim,
-            "loss_p10":      loss_p10,
-            "loss_median":   loss_p50,
-            "loss_p90":      loss_p90,
-            "top1_acc":      pred_stats["top1_acc_per_agent"].mean().item(),
-            "top1_per_agent": pred_stats["top1_acc_per_agent"],       # [N]
-            "pos_score":     pred_stats["pos_score_mean"],
-            "neg_score":     pred_stats["neg_score_mean"],
-            "margin":        pred_stats["margin_mean"],
-            "per_agent_loss_mean": per_agent_loss.mean(dim=0),          # [N]
+            "h_diversity":       h_diversity,
+            "delta_diversity":   delta_diversity,
+            "delta_norm_mean":   delta_norm_mean,
+            # Stage-B-specific (on the ACTUAL predictor signals):
+            "local_diversity":       local_diversity,
+            "delta_local_diversity": delta_local_diversity,
+            "delta_local_norm_mean": delta_local_norm_mean,
+            "raw_cos_sim":       raw_cos_sim,
+            "loss_p10":          loss_p10,
+            "loss_median":       loss_p50,
+            "loss_p90":          loss_p90,
+            "top1_acc":          top1_per_agent_avg.mean().item(),
+            "top1_per_agent":    top1_per_agent_avg,           # [N]
+            "pos_score":         pos_score_avg,
+            "neg_score":         neg_score_avg,
+            "margin":            margin_avg,
+            "per_agent_loss_mean":    per_agent_loss.mean(dim=0),  # [N]
+            # Stage-A diagnostics:
+            "per_pair_std_mean":      per_pair_std_mean,
+            "per_pair_std_per_agent": per_pair_std_per_agent,  # [N]
+            # Upstream diagnostics (disambiguates predictor vs encoder):
+            "h_cross_agent_cos":             h_cross_agent_cos,
+            "delta_cross_agent_cos":         delta_cross_agent_cos,
+            "local_summary_cross_agent_cos": local_summary_cross_agent_cos,
+            "team_summary_cross_agent_cos":  team_summary_cross_agent_cos,
+            "delta_local_cross_agent_cos":   delta_local_cross_agent_cos,
         }
 
         return infonce_loss, coord_signal_batch, per_agent_loss, diag
@@ -261,12 +391,23 @@ class CASVDLearner:
         self.mac.init_hidden(current_batch.batch_size)
         mac_out = []
         all_hidden = [] if self.lgdd_enabled else None
+        # Collect pre- and post-TeamGAT latents too.  These are used
+        # ONLY for diagnostics (cross-agent direction cos) so we can
+        # pinpoint whether the encoder-level collapse happens before
+        # or after TeamGATLayer.  Detached; no gradient path to mac.
+        all_local = [] if self.lgdd_enabled else None
+        all_team  = [] if self.lgdd_enabled else None
         for t in range(current_batch.max_seq_length):
-            q_values = self.mac.forward(current_batch, t)
-            mac_out.append(q_values)
             if self.lgdd_enabled:
-                # Detached clone → InfoNCE gradient never flows into encoder.
+                q_values, latents = self.mac.forward_with_latents(
+                    current_batch, t
+                )
                 all_hidden.append(self.mac.hidden_states.detach().clone())
+                all_local.append(latents["local_summary"].detach().clone())
+                all_team.append(latents["team_summary"].detach().clone())
+            else:
+                q_values = self.mac.forward(current_batch, t)
+            mac_out.append(q_values)
         mac_out = th.stack(mac_out, dim=1)
         mac_out = self.mixer.func_g(mac_out, states, t_env)
 
@@ -374,7 +515,8 @@ class CASVDLearner:
         infonce_diag = None
         if self.lgdd_enabled and self.dynamics_predictor is not None:
             infonce_loss, coord_signal_batch, _, infonce_diag = self._compute_infonce(
-                all_hidden, mask, current_batch.device
+                all_hidden, mask, current_batch.device,
+                all_local=all_local, all_team=all_team,
             )
             # Warm-start: on the very first batch, seed coord_signals directly
             # from the measured values instead of blending with the ones()
@@ -524,12 +666,116 @@ class CASVDLearner:
                         "infonce_loss_p90", infonce_diag["loss_p90"], t_env
                     )
 
-                    # ── Formation proxy ─────────────────────────────
-                    # Cross-agent hidden-state std.  Low = clustered formation;
-                    # high = flanking/dispersed.  Correlate with coord_signal
-                    # across episodes to detect the Problem-3 formation bias.
+                    # ── Formation proxies ───────────────────────────
+                    # h_diversity: cross-agent std of absolute hidden states.
+                    #              Low = clustered; high = dispersed.
+                    # delta_diversity: cross-agent std of Δh_j.  Low = team
+                    #                  evolving synchronously (all doing the
+                    #                  same thing, including standing still);
+                    #                  high = per-agent distinct dynamics.
+                    # delta_norm_mean: typical |Δh_j|.  Near zero = stationary
+                    #                  episode (bunker/waiting), in which case
+                    #                  contrastive comparisons become noisy.
                     self.logger.log_stat(
                         "h_diversity", infonce_diag["h_diversity"], t_env
+                    )
+                    self.logger.log_stat(
+                        "delta_diversity", infonce_diag["delta_diversity"], t_env
+                    )
+                    self.logger.log_stat(
+                        "delta_norm_mean", infonce_diag["delta_norm_mean"], t_env
+                    )
+
+                    # ── Stage-A pairwise diagnostics ────────────────
+                    # per_pair_std_mean: std across teammate-slot losses,
+                    #   averaged over (F, i).  >0 means different teammates
+                    #   of the same agent produce different loss values —
+                    #   the topology-dependent variance we want Stage A to
+                    #   unlock.  Near-zero means all teammates are equally
+                    #   predictable from h_i and Stage A's pairwise fix did
+                    #   not help (escalate to Stage B or C).
+                    self.logger.log_stat(
+                        "per_pair_std_mean",
+                        infonce_diag["per_pair_std_mean"],
+                        t_env,
+                    )
+                    if "per_pair_std_per_agent" in infonce_diag:
+                        for i in range(self.n_agents):
+                            self.logger.log_stat(
+                                f"per_pair_std_agent_{i}",
+                                infonce_diag["per_pair_std_per_agent"][i].item(),
+                                t_env,
+                            )
+
+                    # ── Upstream (encoder-level) diagnostics ────────
+                    # h_cross_agent_cos: average cos(h_i, h_j) for i ≠ j.
+                    #   >0.8 → agents' h vectors all point the same way
+                    #          → downstream fixes (predictor) won't help
+                    #          → need upstream fix (per-agent encoding,
+                    #            pre-GAT target, or identity injection).
+                    #   <0.5 → agents genuinely differ in direction →
+                    #          predictor-collapse is the real issue and
+                    #          doubly-conditioned predictor likely helps.
+                    # delta_cross_agent_cos: same metric on Δh_j.  If the
+                    #   delta operation successfully differentiated agents,
+                    #   this should be lower than h_cross_agent_cos.
+                    self.logger.log_stat(
+                        "h_cross_agent_cos",
+                        infonce_diag["h_cross_agent_cos"],
+                        t_env,
+                    )
+                    self.logger.log_stat(
+                        "delta_cross_agent_cos",
+                        infonce_diag["delta_cross_agent_cos"],
+                        t_env,
+                    )
+                    # ── Encoder-layer-specific cross-agent cos ──────
+                    # Pinpoints where the direction-collapse happens:
+                    #   local_summary: pre-TeamGAT (agent-local only).
+                    #     If <0.5 → TeamGAT is the culprit → Stage B
+                    #     (use local_summary as predictor input/target)
+                    #     will break the aggregate-uniformity block.
+                    #   team_summary: post-TeamGAT.
+                    #     If ≈ h_cross_agent_cos → collapse happens at
+                    #     or after TeamGAT (no surprise).
+                    # delta_local: change in local_summary per step.
+                    #     Useful for Stage B target planning.
+                    self.logger.log_stat(
+                        "local_summary_cross_agent_cos",
+                        infonce_diag["local_summary_cross_agent_cos"],
+                        t_env,
+                    )
+                    self.logger.log_stat(
+                        "team_summary_cross_agent_cos",
+                        infonce_diag["team_summary_cross_agent_cos"],
+                        t_env,
+                    )
+                    self.logger.log_stat(
+                        "delta_local_cross_agent_cos",
+                        infonce_diag["delta_local_cross_agent_cos"],
+                        t_env,
+                    )
+
+                    # ── Stage-B signal magnitudes ──────────────────
+                    # These describe the ACTUAL signal the predictor
+                    # is operating on now (local_summary and Δlocal).
+                    # Compare against the legacy h_diversity /
+                    # delta_diversity / delta_norm_mean to see what
+                    # changed when we switched to pre-TeamGAT.
+                    self.logger.log_stat(
+                        "local_diversity",
+                        infonce_diag["local_diversity"],
+                        t_env,
+                    )
+                    self.logger.log_stat(
+                        "delta_local_diversity",
+                        infonce_diag["delta_local_diversity"],
+                        t_env,
+                    )
+                    self.logger.log_stat(
+                        "delta_local_norm_mean",
+                        infonce_diag["delta_local_norm_mean"],
+                        t_env,
                     )
 
                     # ── Per-agent InfoNCE loss and top-1 accuracy ───

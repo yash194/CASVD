@@ -70,7 +70,7 @@ standardise_rewards: False
 entropy_coef: 0.03
 
 # ── Components 3 & 4 disabled for baseline test ──────────────
-lgdd_enabled: False
+lgdd_enabled: True
 use_adaptive_alpha: False
 
 # ── Coord signal EMA (used when lgdd_enabled=True) ──────────
