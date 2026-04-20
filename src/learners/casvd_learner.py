@@ -43,8 +43,38 @@ class CASVDLearner:
 
         self.entropy_coef = getattr(args, "entropy_coef", 0.03)
 
+        # ── α mode toggle (scalar / per_agent_fixed / adaptive) ──
+        # Decides the α vector used in soft-policy softmax and entropy
+        # bonus.  If `alpha_mode` is unset, fall back to the legacy
+        # `use_adaptive_alpha` flag for backward compatibility.
+        default_mode = "adaptive" if getattr(args, "use_adaptive_alpha", False) else "scalar"
+        self.alpha_mode = str(getattr(args, "alpha_mode", default_mode)).lower()
+        assert self.alpha_mode in ("scalar", "per_agent_fixed", "adaptive"), (
+            f"alpha_mode must be one of 'scalar', 'per_agent_fixed', 'adaptive'; "
+            f"got {self.alpha_mode!r}"
+        )
+
+        if self.alpha_mode == "per_agent_fixed":
+            per_agent_alphas = list(getattr(args, "per_agent_alphas", []))
+            assert len(per_agent_alphas) == self.n_agents, (
+                f"per_agent_alphas must have length n_agents={self.n_agents}, "
+                f"got {len(per_agent_alphas)}: {per_agent_alphas}"
+            )
+            assert all(a > 0 for a in per_agent_alphas), (
+                f"per_agent_alphas must be strictly positive; got {per_agent_alphas}"
+            )
+            self._alpha_vec_cpu = th.tensor(per_agent_alphas, dtype=th.float32)
+        else:
+            # scalar and adaptive both initialise as a uniform vector at
+            # entropy_coef.  adaptive mode mutates this vector on the fly
+            # using coord_signals; scalar leaves it untouched.
+            self._alpha_vec_cpu = th.full(
+                (self.n_agents,), float(self.entropy_coef), dtype=th.float32
+            )
+        self._alpha_vec = None  # lazy device placement
+
         # ── Per-agent adaptive alpha (off by default) ──
-        self.use_adaptive_alpha = getattr(args, "use_adaptive_alpha", False)
+        self.use_adaptive_alpha = (self.alpha_mode == "adaptive")
         self._coord_signals = None
         self._coord_warmup = True   # first batch seeds directly, no EMA blending
         # τ = 0.95 → time constant ~20 training steps ≈ 0.2 % of a 10 M-step run.
@@ -63,8 +93,13 @@ class CASVDLearner:
         if self.lgdd_enabled:
             from modules.predictors import InfoNCEPredictor
 
+            # Stage C: identity-conditioned predictor.
+            # Passing n_agents enables appending a one-hot agent ID to
+            # h_i before the projector.  Breaks shared-predictor symmetry
+            # even when local_summary values are similar across agents.
             self.dynamics_predictor = InfoNCEPredictor(
                 args.hidden_dim,
+                n_agents=self.n_agents,
                 temperature=self.infonce_temperature,
             )
             self.dynamics_params = list(self.dynamics_predictor.parameters())
@@ -93,6 +128,37 @@ class CASVDLearner:
         self.params = self.main_params
         self.last_target_update_episode = 0
         self.log_stats_t = -self.args.learner_log_interval - 1
+
+        # Seed the action selector with the initial α vector so that
+        # rollout and target computation use the same α from step 0.
+        # (For adaptive mode this is overwritten after each train step
+        # once coord_signals update.)
+        self.mac.set_alpha(self._alpha_vec_cpu.clone())
+
+    def _get_alpha_vec(self, device):
+        """Return per-agent α as a [n_agents] tensor on `device`.
+
+        Lazily places the cached CPU copy onto the target device.  In
+        adaptive mode, rebuilds the vector each call from the current
+        coord_signal EMA (s_i ∈ [0, 1] → α_i = entropy_coef · (0.5 + s_i),
+        so α ranges from 0.5× to 1.5× the base: an agent with worse
+        predicted coordination gets hotter exploration).  In scalar and
+        per_agent_fixed modes, returns the static cached vector.
+        """
+        if self._alpha_vec is None or self._alpha_vec.device != device:
+            self._alpha_vec = self._alpha_vec_cpu.to(device)
+
+        if self.alpha_mode == "adaptive" and self._coord_signals is not None:
+            # Monotonic map: higher coord_signal (→ harder to predict
+            # teammates → less coordinated → needs more exploration) gets
+            # a larger α.  Bounded to [0.5·entropy_coef, 1.5·entropy_coef]
+            # so the policy never collapses or blows up when coord_signal
+            # saturates.
+            coord = self._coord_signals.to(device).clamp(0.0, 1.0)
+            alpha = float(self.entropy_coef) * (0.5 + coord)
+            return alpha
+
+        return self._alpha_vec
 
     def _get_coord_signals(self, device):
         """Lazy-init per-agent coordination signal buffer.
@@ -427,10 +493,15 @@ class CASVDLearner:
             target_mac_out = th.stack(target_mac_out, dim=1)
             target_mac_out = self.target_mixer.func_g(target_mac_out, states, t_env)
 
-            # Soft policy from online net (Double-Q: online selects)
+            # Soft policy from online net (Double-Q: online selects).
+            # α is per-agent in general (see alpha_mode); broadcast [N]
+            # across [B, T, N, n_actions] by reshaping to [1, 1, N, 1].
+            alpha_vec = self._get_alpha_vec(mac_out.device)      # [N]
+            alpha_bcast = alpha_vec.view(1, 1, -1, 1)             # [1,1,N,1]
+
             mac_out_detach = mac_out.clone().detach()
             mac_out_detach = self.mixer.func_f(mac_out_detach, states, t_env)
-            mac_out_detach = mac_out_detach / self.entropy_coef
+            mac_out_detach = mac_out_detach / alpha_bcast
             mac_out_detach[avail_actions == 0] = -9999999
             actions_pdf = th.softmax(mac_out_detach, dim=-1)
 
@@ -447,20 +518,27 @@ class CASVDLearner:
                 target_mac_out.clone(), 3, picked_actions
             ).squeeze(3)
 
-            # Single-sample entropy estimate: -Σ_i log π_i(a*_i)
+            # Single-sample entropy estimate with per-agent α weighting.
+            # For the standard scalar-α case we have:
+            #     bonus = α · H(π) ≈ -α · Σ_i log π_i(a*_i)
+            # For per-agent α we weight each agent's log-prob by its own α
+            # BEFORE summing, so α_i multiplies only agent i's entropy:
+            #     bonus = -Σ_i α_i · log π_i(a*_i).
             target_logp = th.log(actions_pdf + 1e-10)
             target_logp = th.gather(target_logp, 3, picked_actions).squeeze(3)
-            target_entropy = -target_logp.sum(-1, keepdim=True)
+            # target_logp: [B, T, N]; alpha_vec: [N] → [1, 1, N]
+            alpha_logp = alpha_vec.view(1, 1, -1) * target_logp
+            target_entropy = -alpha_logp.sum(-1, keepdim=True)   # α already baked in
 
             # Mix sampled target Q through VDN sum
             target_qvals = self.target_mixer(target_qvals, states)
 
-            # TD(λ) with entropy bonus
+            # TD(λ) with entropy bonus (α already applied above)
             targets = build_td_lambda_targets(
                 rewards, terminated, mask,
                 target_qvals, self.n_agents,
                 self.args.gamma, self.args.td_lambda,
-                target_entropy=target_entropy * self.entropy_coef,
+                target_entropy=target_entropy,
             )
 
         # ═══════════════════════════════════════════════════════
@@ -552,6 +630,12 @@ class CASVDLearner:
         grad_norm = th.nn.utils.clip_grad_norm_(self.main_params, self.args.grad_norm_clip)
         self.main_optimizer.step()
 
+        # Push the current α vector to the action selector so the next
+        # rollout batch uses the same α as this train step.  Cheap — a
+        # tiny [n_agents] tensor copy.  Only meaningful for adaptive
+        # mode, but kept unconditional to keep the code path uniform.
+        self.mac.set_alpha(self._get_alpha_vec(current_batch.device).detach().clone())
+
         # ═══════════════════════════════════════════════════════
         # 8. Target network updates
         # ═══════════════════════════════════════════════════════
@@ -595,6 +679,14 @@ class CASVDLearner:
             )
             self.logger.log_stat("entropy", target_entropy.mean().item(), t_env)
             self.logger.log_stat("entropy_coef", self.entropy_coef, t_env)
+            # α-mode diagnostics: log the per-agent α used this step so
+            # Run B (per_agent_fixed) can be verified and adaptive-mode
+            # runs can be debugged.
+            alpha_log = self._get_alpha_vec(mac_out.device).detach()
+            self.logger.log_stat("alpha_mean", alpha_log.mean().item(), t_env)
+            self.logger.log_stat("alpha_std",  alpha_log.std().item(),  t_env)
+            for i in range(self.n_agents):
+                self.logger.log_stat(f"alpha_agent_{i}", alpha_log[i].item(), t_env)
             self.logger.log_stat(
                 "err_mask", (mask_sum.sum() / mask_exp.sum()).item(), t_env
             )

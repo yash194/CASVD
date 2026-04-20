@@ -70,10 +70,14 @@ class CASVDMAC:
     def set_alpha(self, alpha):
         """Called by the learner to update the Boltzmann temperature.
 
-        This connects the coordination-aware alpha to the action selection
-        policy, as specified in CASVD.md.
+        Supports two action-selector flavours:
+          - SoftPolicyActionSelector: per-agent α vector via `alpha_vec`
+            (alpha may be a [n_agents] tensor or a scalar).
+          - BoltzmannActionSelector: legacy scalar α via `alpha`.
         """
-        if hasattr(self.action_selector, "alpha"):
+        if hasattr(self.action_selector, "alpha_vec"):
+            self.action_selector.alpha_vec = alpha
+        elif hasattr(self.action_selector, "alpha"):
             self.action_selector.alpha = alpha
 
     def init_hidden(self, batch_size):

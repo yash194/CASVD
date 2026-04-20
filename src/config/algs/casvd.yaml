@@ -73,6 +73,25 @@ entropy_coef: 0.03
 lgdd_enabled: True
 use_adaptive_alpha: False
 
+# ── α (entropy-coef) mode toggle (premise test) ──────────────
+# Decides how α is assigned to agents during Soft-QMIX policy
+# softmax and entropy-bonus computation.
+#
+#   "scalar"            → all agents share a single α = entropy_coef.
+#                         (Run A baseline, already tested.)
+#   "per_agent_fixed"   → per-agent α from `per_agent_alphas` below.
+#                         Lets us test whether differentiated α matters
+#                         at all, independent of any coord_signal sensor.
+#                         (Run B.)
+#   "adaptive"          → α driven by the coord_signal EMA (current
+#                         adaptive pipeline).  Equivalent to the legacy
+#                         `use_adaptive_alpha: True` path.
+#
+# If `alpha_mode` is absent, it defaults to "adaptive" when
+# `use_adaptive_alpha: True`, otherwise "scalar".
+alpha_mode: "per_agent_fixed"
+per_agent_alphas: [0.01, 0.02, 0.03, 0.04, 0.05]
+
 # ── Coord signal EMA (used when lgdd_enabled=True) ──────────
 # τ = 0.95 → time constant ~20 training steps ≈ 0.2% of a 10M-step run.
 # Fast enough to track learning-progress changes, slow enough that

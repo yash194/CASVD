@@ -186,11 +186,20 @@ class SoftPolicyActionSelector():
     During training: applies mixer's func_g and func_f to raw Q-values,
     then samples from the Boltzmann soft policy.
     During test: greedy argmax on raw Q-values (no transformations).
+
+    α supports both scalar and per-agent tensor form.  The learner
+    pushes the current α vector via the controller's `set_alpha` hook
+    (sets `self.alpha_vec`); when a per-agent α tensor is present it
+    takes precedence over the scalar fallback.
     """
 
     def __init__(self, args):
         self.args = args
         self.entropy_coef = getattr(args, "entropy_coef", 0.03)
+        # Per-agent α vector, shape [n_agents].  Set externally by the
+        # learner via CASVDMAC.set_alpha — stays None until then, at
+        # which point the scalar `entropy_coef` fallback is used.
+        self.alpha_vec = None
 
     def select_action(self, agent_inputs, avail_actions, t_env, test_mode=False,
                        mixer=None, states=None):
@@ -205,7 +214,18 @@ class SoftPolicyActionSelector():
             q = mixer.func_g(q, states, t_env).detach()
             q = mixer.func_f(q, states, t_env).detach()
 
-        logits = q / self.entropy_coef
+        # Per-agent α if available, else scalar.  agent_inputs is
+        # [B, n_agents, n_actions]; reshape α [N] → [1, N, 1] to divide.
+        if self.alpha_vec is not None:
+            alpha = self.alpha_vec
+            if hasattr(alpha, "to"):
+                alpha = alpha.to(q.device)
+                divisor = alpha.view(1, -1, 1)
+            else:
+                divisor = float(alpha)
+            logits = q / divisor
+        else:
+            logits = q / self.entropy_coef
         logits[avail_actions == 0] = -float("inf")
         probs = th.softmax(logits, dim=-1)
 

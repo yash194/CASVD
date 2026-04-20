@@ -31,17 +31,32 @@ class InfoNCEPredictor(nn.Module):
     coordination signal for adaptive alpha_factor in [0, 1].
     """
 
-    def __init__(self, hidden_dim, temperature=0.1):
+    def __init__(self, hidden_dim, n_agents=None, temperature=0.1):
         super(InfoNCEPredictor, self).__init__()
         self.hidden_dim = hidden_dim
         self.temperature = temperature
+        self.n_agents = n_agents
+
+        # Stage C: identity-conditioned predictor.  When `n_agents` is
+        # provided, the forward pass concatenates a one-hot agent ID to
+        # h_i before projection, so the predictor can learn a DIFFERENT
+        # output direction per (querying) agent.  Previously (Stage A/B)
+        # the predictor's input was only h_i and with `local_summary_i`
+        # at cos≈0.72 across agents the predictor collapsed to a
+        # near-identical output for every agent — producing uniform
+        # per-agent loss aggregates (coord_signal_std ≈ 0.004).
+        #
+        # With identity conditioning, even similar h_i values for
+        # different agents produce distinct inputs to W, which allows
+        # the predictor to specialise per-agent.  The parameter count
+        # grows by only (hidden_dim × n_agents) ≈ 640 weights.
+        input_dim = hidden_dim + (n_agents if n_agents is not None else 0)
 
         # Two-layer MLP projector: learns nonlinear features that predict global outcomes.
-        # Layer 1: hidden_dim → hidden_dim with ReLU (nonlinear extraction)
+        # Layer 1: input_dim → hidden_dim with ReLU (nonlinear extraction)
         # Layer 2: hidden_dim → hidden_dim (projection to similarity space, no bias)
-        # Fix 4: replaced single linear W to break coord_signal plateau at ~0.44
         self.W = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim, bias=True),
+            nn.Linear(input_dim, hidden_dim, bias=True),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim, bias=False),
         )
@@ -76,10 +91,28 @@ class InfoNCEPredictor(nn.Module):
         B, n_agents, D = h_i.shape
         K = g_neg.shape[1]
 
+        # Stage C: append agent identity one-hot to h_i before W.  This
+        # breaks the shared-predictor symmetry — even when local_summary_i
+        # and local_summary_j are at cos≈0.72, appending distinct one-hot
+        # identities forces W(·) to produce differentiated outputs per
+        # agent.  Without this step, Stage B alone produced coord_signal_std
+        # ≈ 0.004 despite having orthogonal targets.
+        if self.n_agents is not None:
+            assert n_agents == self.n_agents, (
+                f"InfoNCEPredictor was built for n_agents={self.n_agents} "
+                f"but received h_i with {n_agents} agents"
+            )
+            id_onehot = th.eye(
+                n_agents, device=h_i.device, dtype=h_i.dtype
+            ).unsqueeze(0).expand(B, -1, -1)      # [B, n_agents, n_agents]
+            h_i_in = th.cat([h_i, id_onehot], dim=-1)  # [B, n_agents, D + n_agents]
+        else:
+            h_i_in = h_i
+
         # Project h_i through W and L2-normalise
-        h_proj  = F.normalize(self.W(h_i), dim=-1)   # [B, n_agents, D]
-        g_pos_n = F.normalize(g_pos, dim=-1)          # [B, n_agents, D]
-        g_neg_n = F.normalize(g_neg, dim=-1)          # [B, K, D]
+        h_proj  = F.normalize(self.W(h_i_in), dim=-1)  # [B, n_agents, D]
+        g_pos_n = F.normalize(g_pos, dim=-1)           # [B, n_agents, D]
+        g_neg_n = F.normalize(g_neg, dim=-1)           # [B, K, D]
 
         # Positive scores: agent i vs its OWN others-future (element-wise dot then sum)
         # h_proj: [B, n_agents, D], g_pos_n: [B, n_agents, D] → [B, n_agents]
