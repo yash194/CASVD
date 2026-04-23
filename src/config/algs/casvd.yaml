@@ -73,24 +73,36 @@ entropy_coef: 0.03
 lgdd_enabled: True
 use_adaptive_alpha: False
 
-# ── α (entropy-coef) mode toggle (premise test) ──────────────
+# ── α (entropy-coef) mode toggle ─────────────────────────────
 # Decides how α is assigned to agents during Soft-QMIX policy
-# softmax and entropy-bonus computation.
+# softmax (sampling).  Target entropy bonus always uses scalar
+# α = entropy_coef regardless of mode (Component 1 fix).
 #
-#   "scalar"            → all agents share a single α = entropy_coef.
-#                         (Run A baseline, already tested.)
-#   "per_agent_fixed"   → per-agent α from `per_agent_alphas` below.
-#                         Lets us test whether differentiated α matters
-#                         at all, independent of any coord_signal sensor.
-#                         (Run B.)
-#   "adaptive"          → α driven by the coord_signal EMA (current
-#                         adaptive pipeline).  Equivalent to the legacy
-#                         `use_adaptive_alpha: True` path.
-#
-# If `alpha_mode` is absent, it defaults to "adaptive" when
-# `use_adaptive_alpha: True`, otherwise "scalar".
-alpha_mode: "per_agent_fixed"
+#   "scalar"            → all agents share α = entropy_coef (Run A baseline).
+#   "per_agent_fixed"   → per-agent α from `per_agent_alphas` (Run B premise).
+#   "adaptive"          → α driven by InfoNCE coord_signal EMA (legacy path).
+#   "q_spread_adaptive" → NEW.  α_i = α_mean / clamp(spread_i / spread_mean,
+#                          conf_min, conf_max).  Confident agents (wide Q
+#                          spread) get lower α; uncertain agents get higher α.
+#                          State-adaptive, no extra network, no second optimiser.
+alpha_mode: "q_spread_adaptive"
 per_agent_alphas: [0.01, 0.02, 0.03, 0.04, 0.05]
+
+# Q-spread EMA for q_spread_adaptive mode.
+# τ = 0.99 → time constant ~100 train steps; decouples α from per-batch noise
+# but still tracks gradual shifts in the policy's decision confidence.
+q_spread_ema_tau: 0.99
+q_spread_conf_min: 0.3
+q_spread_conf_max: 3.0
+
+# ── Component 3: curriculum warmup for α heterogeneity ───────
+# Before `alpha_warmup_start`  → α is uniform α_mean (pure scalar Soft-QMIX).
+# After  `alpha_warmup_end`    → α is fully heterogeneous per the current mode.
+# Between → linear blend.  Lets the team learn basic combat strategies on a
+# symmetric objective before exposing the joint policy to heterogeneous
+# exploration, which prevents the stalling attractor we saw in Run B.
+alpha_warmup_start: 2000000
+alpha_warmup_end:   4000000
 
 # ── Coord signal EMA (used when lgdd_enabled=True) ──────────
 # τ = 0.95 → time constant ~20 training steps ≈ 0.2% of a 10M-step run.

@@ -43,15 +43,25 @@ class CASVDLearner:
 
         self.entropy_coef = getattr(args, "entropy_coef", 0.03)
 
-        # ── α mode toggle (scalar / per_agent_fixed / adaptive) ──
-        # Decides the α vector used in soft-policy softmax and entropy
-        # bonus.  If `alpha_mode` is unset, fall back to the legacy
-        # `use_adaptive_alpha` flag for backward compatibility.
+        # ── α mode toggle ──
+        # Modes:
+        #   "scalar"           – all agents share α = entropy_coef (Run A baseline).
+        #   "per_agent_fixed"  – hardcoded per-agent α from config (Run B premise test).
+        #   "adaptive"         – α driven by InfoNCE coord_signal EMA (legacy path;
+        #                        code kept intact for later diagnostics).
+        #   "q_spread_adaptive"– NEW (Component 2).  Per-agent α derived from the
+        #                        current Q-value spread: confident agent (wide spread,
+        #                        clear best action) gets low α and commits; uncertain
+        #                        agent (flat Q) gets high α and hedges.  Uses only
+        #                        signals already computed by the learner — no extra
+        #                        network, no second optimiser.
         default_mode = "adaptive" if getattr(args, "use_adaptive_alpha", False) else "scalar"
         self.alpha_mode = str(getattr(args, "alpha_mode", default_mode)).lower()
-        assert self.alpha_mode in ("scalar", "per_agent_fixed", "adaptive"), (
-            f"alpha_mode must be one of 'scalar', 'per_agent_fixed', 'adaptive'; "
-            f"got {self.alpha_mode!r}"
+        assert self.alpha_mode in (
+            "scalar", "per_agent_fixed", "adaptive", "q_spread_adaptive"
+        ), (
+            "alpha_mode must be one of 'scalar', 'per_agent_fixed', 'adaptive', "
+            f"'q_spread_adaptive'; got {self.alpha_mode!r}"
         )
 
         if self.alpha_mode == "per_agent_fixed":
@@ -81,6 +91,30 @@ class CASVDLearner:
         # Fast enough that early-training coordination changes actually move the
         # signal; slow enough that per-batch sampling noise averages out.
         self.coord_signal_ema_tau = getattr(args, "coord_signal_ema_tau", 0.95)
+
+        # ── Component 2: Q-spread sensor state ──
+        # EMA of per-agent Q-spread (max_a Q - min_a Q over avail actions).
+        # Populated each train step when alpha_mode == "q_spread_adaptive".
+        self._q_spread_ema = None
+        self.q_spread_ema_tau = getattr(args, "q_spread_ema_tau", 0.99)
+        # Confidence ratio clamp — bounds α to
+        # [entropy_coef / conf_max, entropy_coef / conf_min].
+        # With defaults 0.3–3.0 → α ∈ [α_mean/3, α_mean·3.33].  Prevents
+        # degenerate greedy / uniform agents when spreads are extreme.
+        self.q_spread_conf_min = getattr(args, "q_spread_conf_min", 0.3)
+        self.q_spread_conf_max = getattr(args, "q_spread_conf_max", 3.0)
+
+        # ── Component 3: curriculum warmup for α heterogeneity ──
+        # Ramp 0→1 applied to (α_het − α_mean) so training starts as pure
+        # scalar-α Soft-QMIX and phases in per-agent heterogeneity over
+        # [alpha_warmup_start, alpha_warmup_end].  Prevents the early-training
+        # coordination tax that caused Run B's stalling attractor.
+        self.alpha_warmup_start = int(getattr(args, "alpha_warmup_start", 2_000_000))
+        self.alpha_warmup_end   = int(getattr(args, "alpha_warmup_end",   4_000_000))
+        assert self.alpha_warmup_end >= self.alpha_warmup_start >= 0, (
+            f"alpha_warmup_end ({self.alpha_warmup_end}) must be ≥ "
+            f"alpha_warmup_start ({self.alpha_warmup_start}) ≥ 0"
+        )
 
         # ── InfoNCE coordination sensor (off by default) ──
         self.lgdd_enabled = getattr(args, "lgdd_enabled", False)
@@ -135,30 +169,113 @@ class CASVDLearner:
         # once coord_signals update.)
         self.mac.set_alpha(self._alpha_vec_cpu.clone())
 
-    def _get_alpha_vec(self, device):
+    def _alpha_ramp(self, t_env):
+        """Component 3 curriculum: linear ramp 0→1 over the warmup window.
+
+        Before `alpha_warmup_start` → 0 (α is uniform α_mean).
+        After  `alpha_warmup_end`   → 1 (full heterogeneous α).
+        Between → linear interpolation.
+        """
+        if t_env is None:
+            return 1.0
+        start = self.alpha_warmup_start
+        end   = self.alpha_warmup_end
+        if t_env <= start:
+            return 0.0
+        if t_env >= end:
+            return 1.0
+        span = max(1, end - start)
+        return float(t_env - start) / float(span)
+
+    def _update_q_spread_ema(self, mac_out, avail_actions, mask):
+        """Component 2: update per-agent Q-spread EMA from the current batch.
+
+        Q-spread_i(b, t) = max_{a ∈ avail} Q_i(s_{b,t}, a)
+                         − min_{a ∈ avail} Q_i(s_{b,t}, a)
+
+        Wide spread → agent has a clearly best action → should commit (low α).
+        Narrow spread → agent is uncertain → should hedge (high α).
+
+        Averaged over valid timesteps (with mask) and over agents that actually
+        have at least one available action in that step (drops dead-agent noise).
+        Feeds a per-agent EMA with τ = `q_spread_ema_tau`.
+        """
+        avail_float = avail_actions.float()
+        # Mask unavailable actions so they don't contaminate max / min
+        q_for_max = mac_out.masked_fill(avail_actions == 0, float("-inf"))
+        q_for_min = mac_out.masked_fill(avail_actions == 0, float("inf"))
+        q_spread = q_for_max.max(dim=-1).values - q_for_min.min(dim=-1).values  # [B, T, N]
+
+        # Slice to training timesteps (mask is [B, T-1, 1])
+        q_spread = q_spread[:, :-1]                                              # [B, T-1, N]
+        # Any agent with NO avail actions at (b, t) → spread is ±inf; zero it out
+        q_spread = th.nan_to_num(q_spread, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # Per-(b, t, i) validity: step is valid AND agent has avail actions
+        has_avail = (avail_float[:, :-1].sum(dim=-1) > 0).float()                # [B, T-1, N]
+        mask_bt_i = mask.expand_as(q_spread) * has_avail                         # [B, T-1, N]
+
+        denom = mask_bt_i.sum(dim=(0, 1)).clamp(min=1.0)                         # [N]
+        q_spread_per_agent = (q_spread * mask_bt_i).sum(dim=(0, 1)) / denom      # [N]
+        q_spread_per_agent = q_spread_per_agent.detach()
+
+        if self._q_spread_ema is None or self._q_spread_ema.device != q_spread_per_agent.device:
+            self._q_spread_ema = q_spread_per_agent.clone()
+        else:
+            tau = self.q_spread_ema_tau
+            self._q_spread_ema = tau * self._q_spread_ema + (1.0 - tau) * q_spread_per_agent
+
+    def _get_alpha_vec(self, device, t_env=None):
         """Return per-agent α as a [n_agents] tensor on `device`.
 
-        Lazily places the cached CPU copy onto the target device.  In
-        adaptive mode, rebuilds the vector each call from the current
-        coord_signal EMA (s_i ∈ [0, 1] → α_i = entropy_coef · (0.5 + s_i),
-        so α ranges from 0.5× to 1.5× the base: an agent with worse
-        predicted coordination gets hotter exploration).  In scalar and
-        per_agent_fixed modes, returns the static cached vector.
+        Computes a heterogeneous α_het based on `alpha_mode`, then blends
+        it against the uniform α_mean via the Component-3 curriculum ramp:
+
+            α_effective = α_mean + ramp(t_env) · (α_het − α_mean)
+
+        At t_env ≤ alpha_warmup_start ⇒ α = α_mean (pure scalar Soft-QMIX).
+        At t_env ≥ alpha_warmup_end   ⇒ α = α_het  (full heterogeneity).
+
+        Modes:
+          - scalar            → α_het = α_mean (ramp irrelevant)
+          - per_agent_fixed   → α_het = hardcoded config vector
+          - adaptive          → α_het from coord_signal EMA (legacy, intact)
+          - q_spread_adaptive → α_het = α_mean / confidence_i where
+                                 confidence_i = clamp(spread_i / spread_mean,
+                                                      conf_min, conf_max).
+                                 Confident agent ⇒ α_i < α_mean (commits).
+                                 Uncertain agent ⇒ α_i > α_mean (hedges).
         """
         if self._alpha_vec is None or self._alpha_vec.device != device:
             self._alpha_vec = self._alpha_vec_cpu.to(device)
 
-        if self.alpha_mode == "adaptive" and self._coord_signals is not None:
-            # Monotonic map: higher coord_signal (→ harder to predict
-            # teammates → less coordinated → needs more exploration) gets
-            # a larger α.  Bounded to [0.5·entropy_coef, 1.5·entropy_coef]
-            # so the policy never collapses or blows up when coord_signal
-            # saturates.
+        # ── Select the heterogeneous target α for this mode ──
+        if self.alpha_mode == "q_spread_adaptive" and self._q_spread_ema is not None:
+            spread = self._q_spread_ema.to(device)
+            mean_spread = spread.mean().clamp(min=1e-6)
+            confidence = (spread / mean_spread).clamp(
+                self.q_spread_conf_min, self.q_spread_conf_max
+            )
+            alpha_het = float(self.entropy_coef) / confidence
+        elif self.alpha_mode == "adaptive" and self._coord_signals is not None:
+            # Legacy InfoNCE-driven path — kept intact for later use.
             coord = self._coord_signals.to(device).clamp(0.0, 1.0)
-            alpha = float(self.entropy_coef) * (0.5 + coord)
-            return alpha
+            alpha_het = float(self.entropy_coef) * (0.5 + coord)
+        else:
+            # scalar / per_agent_fixed / pre-EMA q_spread_adaptive
+            alpha_het = self._alpha_vec
 
-        return self._alpha_vec
+        # ── Component 3: curriculum blend towards α_mean ──
+        ramp = self._alpha_ramp(t_env)
+        if ramp >= 1.0:
+            return alpha_het
+        if ramp <= 0.0:
+            # Full uniform α_mean — reuse or build on-device tensor
+            return th.full_like(self._alpha_vec, float(self.entropy_coef))
+
+        alpha_mean_val = float(self.entropy_coef)
+        alpha_vec = alpha_mean_val + ramp * (alpha_het - alpha_mean_val)
+        return alpha_vec
 
     def _get_coord_signals(self, device):
         """Lazy-init per-agent coordination signal buffer.
@@ -493,11 +610,18 @@ class CASVDLearner:
             target_mac_out = th.stack(target_mac_out, dim=1)
             target_mac_out = self.target_mixer.func_g(target_mac_out, states, t_env)
 
+            # Component 2: refresh Q-spread EMA from this batch BEFORE
+            # computing α (only has effect when mode == q_spread_adaptive).
+            if self.alpha_mode == "q_spread_adaptive":
+                self._update_q_spread_ema(mac_out, avail_actions, mask)
+
             # Soft policy from online net (Double-Q: online selects).
             # α is per-agent in general (see alpha_mode); broadcast [N]
             # across [B, T, N, n_actions] by reshaping to [1, 1, N, 1].
-            alpha_vec = self._get_alpha_vec(mac_out.device)      # [N]
-            alpha_bcast = alpha_vec.view(1, 1, -1, 1)             # [1,1,N,1]
+            # Curriculum-ramped by t_env (Component 3): early training is
+            # uniform, heterogeneity fades in after `alpha_warmup_start`.
+            alpha_vec = self._get_alpha_vec(mac_out.device, t_env=t_env)  # [N]
+            alpha_bcast = alpha_vec.view(1, 1, -1, 1)                      # [1,1,N,1]
 
             mac_out_detach = mac_out.clone().detach()
             mac_out_detach = self.mixer.func_f(mac_out_detach, states, t_env)
@@ -518,17 +642,18 @@ class CASVDLearner:
                 target_mac_out.clone(), 3, picked_actions
             ).squeeze(3)
 
-            # Single-sample entropy estimate with per-agent α weighting.
-            # For the standard scalar-α case we have:
-            #     bonus = α · H(π) ≈ -α · Σ_i log π_i(a*_i)
-            # For per-agent α we weight each agent's log-prob by its own α
-            # BEFORE summing, so α_i multiplies only agent i's entropy:
-            #     bonus = -Σ_i α_i · log π_i(a*_i).
+            # Component 1: decouple sampling-α from target-α.
+            # The SAMPLING softmax above uses per-agent α_vec (heterogeneous
+            # exploration).  The TARGET entropy bonus below uses the SCALAR
+            # α_mean = entropy_coef for every agent.  This makes the
+            # regularised objective identical to scalar-α Soft-QMIX (Run A),
+            # which removes the per-agent "coordination tax" that caused
+            # Run B's late-training stalling attractor.  Heterogeneity is
+            # preserved in policy sampling, not in the objective itself.
             target_logp = th.log(actions_pdf + 1e-10)
-            target_logp = th.gather(target_logp, 3, picked_actions).squeeze(3)
-            # target_logp: [B, T, N]; alpha_vec: [N] → [1, 1, N]
-            alpha_logp = alpha_vec.view(1, 1, -1) * target_logp
-            target_entropy = -alpha_logp.sum(-1, keepdim=True)   # α already baked in
+            target_logp = th.gather(target_logp, 3, picked_actions).squeeze(3)  # [B, T, N]
+            alpha_target_scalar = float(self.entropy_coef)
+            target_entropy = -alpha_target_scalar * target_logp.sum(-1, keepdim=True)
 
             # Mix sampled target Q through VDN sum
             target_qvals = self.target_mixer(target_qvals, states)
@@ -632,9 +757,11 @@ class CASVDLearner:
 
         # Push the current α vector to the action selector so the next
         # rollout batch uses the same α as this train step.  Cheap — a
-        # tiny [n_agents] tensor copy.  Only meaningful for adaptive
-        # mode, but kept unconditional to keep the code path uniform.
-        self.mac.set_alpha(self._get_alpha_vec(current_batch.device).detach().clone())
+        # tiny [n_agents] tensor copy.  Curriculum-ramped via t_env so
+        # early-training rollouts also stay on uniform α_mean.
+        self.mac.set_alpha(
+            self._get_alpha_vec(current_batch.device, t_env=t_env).detach().clone()
+        )
 
         # ═══════════════════════════════════════════════════════
         # 8. Target network updates
@@ -681,12 +808,32 @@ class CASVDLearner:
             self.logger.log_stat("entropy_coef", self.entropy_coef, t_env)
             # α-mode diagnostics: log the per-agent α used this step so
             # Run B (per_agent_fixed) can be verified and adaptive-mode
-            # runs can be debugged.
-            alpha_log = self._get_alpha_vec(mac_out.device).detach()
+            # runs can be debugged.  Curriculum-ramped value.
+            alpha_log = self._get_alpha_vec(mac_out.device, t_env=t_env).detach()
             self.logger.log_stat("alpha_mean", alpha_log.mean().item(), t_env)
             self.logger.log_stat("alpha_std",  alpha_log.std().item(),  t_env)
             for i in range(self.n_agents):
                 self.logger.log_stat(f"alpha_agent_{i}", alpha_log[i].item(), t_env)
+
+            # Component 3 ramp value (0 early, 1 after warmup_end).
+            self.logger.log_stat("alpha_ramp", self._alpha_ramp(t_env), t_env)
+
+            # Component 2 sensor diagnostics (q_spread EMA per-agent).
+            # Logged regardless of alpha_mode so scalar / per_agent_fixed
+            # runs can still compare the "would-have-been" spread signal.
+            if self._q_spread_ema is not None:
+                qs = self._q_spread_ema.detach()
+                self.logger.log_stat("q_spread_mean", qs.mean().item(), t_env)
+                self.logger.log_stat("q_spread_std",  qs.std().item(),  t_env)
+                self.logger.log_stat(
+                    "q_spread_ratio",
+                    (qs.max() / qs.min().clamp(min=1e-6)).item(),
+                    t_env,
+                )
+                for i in range(self.n_agents):
+                    self.logger.log_stat(
+                        f"q_spread_agent_{i}", qs[i].item(), t_env
+                    )
             self.logger.log_stat(
                 "err_mask", (mask_sum.sum() / mask_exp.sum()).item(), t_env
             )
