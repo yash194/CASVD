@@ -1,0 +1,112 @@
+# ─── Pure Soft-QMIX baseline (NO GAT, NO LGDD, NO adaptive α) ───
+#
+# This is the "ultimate baseline" that matches the Soft-QMIX paper:
+#   - Standard RNN agent (no graph attention encoder).
+#   - VDN-style mix + func_g (order-preserving) + func_f (per-agent temperature).
+#   - Sample-based entropy bonus added to TD(λ) targets.
+#   - Beta loss + weighted-TD loss for stability.
+#   - Scalar α (entropy_coef = 0.03) — no per-agent heterogeneity, no
+#     curriculum, no Q-spread sensor, no InfoNCE coordination signal.
+#
+# Reuses casvd_learner + casvd_mac because they ARE the Soft-QMIX
+# implementation in this repo (only the agent encoder differs).  Set
+# `alpha_mode: scalar` and `lgdd_enabled: False` to disable every
+# CASVD-specific feature, leaving pure Soft-QMIX behaviour.
+#
+# Run: `python src/main.py --config=soft_qmix --env-config=sc2_v2_protoss`
+
+# ── Action selection ─────────────────────────────────────────
+# Training: softmax(func_f(func_g(Q)) / α) sampling (soft policy)
+# Test: greedy argmax on raw Q
+action_selector: "soft_policy"
+epsilon_start: 1.0
+epsilon_finish: 0.05
+epsilon_anneal_time: 100000
+
+# Runner
+runner: "parallel"
+batch_size_run: 8
+
+# Replay buffer
+buffer_size: 5000
+batch_size: 128
+
+# Target updates (hard copy every 200 episodes)
+target_update_interval_or_tau: 200
+
+# Observations
+obs_agent_id: True
+obs_last_action: True
+obs_individual_obs: True
+
+# Controller (CASVDMAC = Soft-QMIX-aware MAC; works with any agent)
+# and agent (n_rnn = standard recurrent agent from Soft-QMIX paper).
+mac: "casvd_mac"
+agent: "n_rnn"
+agent_output_type: "q"
+learner: "casvd_learner"
+
+# ── Soft-QMIX mixer: VDN + func_f + func_g ──────────────────
+mixer: "qmix"
+mixing_embed_dim: 32
+hypernet_embed: 64
+
+# Optimizer
+lr: 0.001
+optimizer: "adam"
+optimizer_epsilon: 0.0000001
+
+# RNN agent (standard Soft-QMIX paper setting)
+rnn_hidden_dim: 64
+hidden_dim: 64                # used by InfoNCE predictor only when lgdd_enabled=True
+use_layer_norm: True
+use_orthogonal: True
+gain: 0.01                     # n_rnn output orthogonal init
+
+# TD learning
+gamma: 0.99
+td_lambda: 0.4
+
+# Gradient clipping
+grad_norm_clip: 10
+
+# Reward standardisation
+standardise_returns: False
+standardise_rewards: False
+
+# ── Soft-QMIX entropy coefficient ───────────────────────────
+entropy_coef: 0.03
+
+# ── ALL CASVD-specific extensions disabled ───────────────────
+lgdd_enabled: False           # InfoNCE coord_signal — OFF
+use_adaptive_alpha: False     # legacy adaptive flag — OFF
+alpha_mode: "scalar"          # uniform α for all agents
+# Component 3 curriculum is a no-op when alpha_mode=scalar
+# (heterogeneity would always be 0), but set the window
+# explicitly so logs are unambiguous.
+alpha_warmup_start: 0
+alpha_warmup_end: 0
+
+# Q-spread sensor params (inert when alpha_mode=scalar — sensor not driving α)
+q_spread_ema_tau: 0.99
+q_spread_conf_min: 0.3
+q_spread_conf_max: 3.0
+
+# Continual learning — OFF
+cl_enabled: False
+cl_memory_buffer_size: 10000
+cl_current_ratio: 0.8
+cl_min_memory_episodes: 128
+cl_teacher_ema_tau: 0.002
+cl_distill_weight: 0.05
+cl_temperature: 0.1
+
+# per_agent_alphas: only consulted if alpha_mode == "per_agent_fixed"
+per_agent_alphas: [0.03, 0.03, 0.03, 0.03, 0.03]
+
+# Coord-signal EMA (inert with lgdd_enabled=False)
+coord_signal_ema_tau: 0.95
+
+store_agent_types: False
+
+name: "soft_qmix"

@@ -81,8 +81,11 @@ class CASVDMAC:
             self.action_selector.alpha = alpha
 
     def init_hidden(self, batch_size):
+        # Expand explicitly to (batch_size, n_agents, -1).  Works whether the
+        # agent's init_hidden returns [n_agents, h] (GAT — already per-agent)
+        # or [1, h] (vanilla RNN — needs broadcasting across agents).
         self.hidden_states = self.agent.init_hidden().unsqueeze(0).expand(
-            batch_size, -1, -1
+            batch_size, self.n_agents, -1
         )
 
     def parameters(self):
