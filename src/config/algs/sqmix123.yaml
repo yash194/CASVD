@@ -1,0 +1,129 @@
+# ─── SQMIX-123: Pure Soft-QMIX + Components 1+2+3 ─────────────
+#
+# This is the critical Phase-1 experiment: take pure Soft-QMIX (RNN
+# encoder, no GAT) and add the three stabilising components from the
+# paper.  Determines whether Components 1+2+3 are a general method
+# or only a fix for GAT-induced damage.
+#
+# Comparison reference points:
+#   • soft_qmix.yaml    : pure Soft-QMIX, scalar α, no components → baseline
+#   • casvd.yaml        : GAT + Soft-QMIX + 3 components           → Run C
+#   • sqmix123.yaml (this file): pure Soft-QMIX + 3 components     → Phase 1
+#
+# Components active:
+#   1. Decoupled target-α (always on in casvd_learner — target uses scalar
+#                          α_mean = entropy_coef while sampling uses α_i)
+#   2. Q-spread sensor    (alpha_mode = "q_spread_adaptive"):
+#                          α_i = α_mean / clamp(spread_i / spread_mean,
+#                                               conf_min, conf_max)
+#   3. Curriculum warmup  (linear ramp from uniform α_mean to heterogeneous
+#                          α over [alpha_warmup_start, alpha_warmup_end])
+#
+# Run: python src/main.py --config=sqmix123 --env-config=sc2_v2_protoss
+
+# ── Action selection ─────────────────────────────────────────
+action_selector: "soft_policy"
+epsilon_start: 1.0
+epsilon_finish: 0.05
+epsilon_anneal_time: 100000
+
+# Runner
+runner: "parallel"
+batch_size_run: 8
+
+# Replay buffer
+buffer_size: 5000
+batch_size: 128
+
+# Target updates (hard copy every 200 episodes)
+target_update_interval_or_tau: 200
+
+# Observations
+obs_agent_id: True
+obs_last_action: True
+obs_individual_obs: True
+
+# ── Controller + agent: RNN (no GAT) ─────────────────────────
+mac: "casvd_mac"           # Soft-QMIX-aware MAC (mixer hookup, set_alpha)
+agent: "n_rnn"             # standard recurrent agent — no graph attention
+agent_output_type: "q"
+learner: "casvd_learner"
+
+# ── Soft-QMIX mixer: VDN + func_f + func_g ──────────────────
+mixer: "qmix"
+mixing_embed_dim: 32
+hypernet_embed: 64
+
+# Optimizer
+lr: 0.001
+optimizer: "adam"
+optimizer_epsilon: 0.0000001
+
+# RNN agent
+rnn_hidden_dim: 64
+hidden_dim: 64                # unused (only InfoNCE predictor consumes it)
+use_layer_norm: True
+use_orthogonal: True
+gain: 0.01
+
+# TD learning
+gamma: 0.99
+td_lambda: 0.4
+
+# Gradient clipping
+grad_norm_clip: 10
+
+# Reward standardisation
+standardise_returns: False
+standardise_rewards: False
+
+# ── Soft-QMIX entropy coefficient (the "α_mean" in the paper) ──
+entropy_coef: 0.03
+
+# ═══════════════════════════════════════════════════════════
+# COMPONENTS 1+2+3 — what makes this different from soft_qmix.yaml
+# ═══════════════════════════════════════════════════════════
+
+# Component 1: decoupled sampling-α from target-α.
+# This is hard-coded in src/learners/casvd_learner.py:
+#   target_entropy = -entropy_coef * sum_i log π_i(a*_i)   (scalar α_mean)
+#   policy sampling: softmax(Q_i / α_i)                    (per-agent α_i)
+# No yaml flag needed — the learner always uses scalar α_mean in the target,
+# regardless of alpha_mode.
+
+# Component 2: Q-spread per-agent sensor drives α heterogeneity.
+alpha_mode: "q_spread_adaptive"
+q_spread_ema_tau: 0.99       # EMA time-constant for per-agent Q-spread
+q_spread_conf_min: 0.3       # confidence clamp lower bound (α_max = α_mean/0.3)
+q_spread_conf_max: 3.0       # confidence clamp upper bound (α_min = α_mean/3.0)
+
+# Component 3: curriculum — uniform α before warmup_start, full heterogeneity
+# after warmup_end, linear blend in between.  2M → 4M is what Run C used.
+alpha_warmup_start: 2000000
+alpha_warmup_end:   4000000
+
+# Legacy adaptive flag (must remain False — Component 2 supersedes it)
+use_adaptive_alpha: False
+
+# ── InfoNCE / LGDD — OFF (legacy code, kept for diagnostics only) ──
+lgdd_enabled: False
+infonce_n_negatives: 15
+infonce_temperature: 0.1
+coord_signal_ema_tau: 0.95
+
+# ── Continual learning — OFF ─────────────────────────────────
+cl_enabled: False
+cl_memory_buffer_size: 10000
+cl_current_ratio: 0.8
+cl_min_memory_episodes: 128
+cl_teacher_ema_tau: 0.002
+cl_distill_weight: 0.05
+cl_temperature: 0.1
+
+# Inert when alpha_mode != "per_agent_fixed" — but kept here so the
+# learner's __init__ doesn't error if someone flips the mode for debug.
+per_agent_alphas: [0.03, 0.03, 0.03, 0.03, 0.03]
+
+store_agent_types: False
+
+name: "sqmix123"

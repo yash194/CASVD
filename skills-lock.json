@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "skills": {
+    "research-paper-writer": {
+      "source": "ailabs-393/ai-labs-claude-skills",
+      "sourceType": "github",
+      "computedHash": "67be14e704ff0c2972e4fcfd164bffa4504898590ed43276d6ada1a376934748"
+    }
+  }
+}
