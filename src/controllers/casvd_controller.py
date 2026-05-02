@@ -70,11 +70,15 @@ class CASVDMAC:
     def set_alpha(self, alpha):
         """Called by the learner to update the Boltzmann temperature.
 
-        This connects the coordination-aware alpha to the action selection
-        policy, as specified in CASVD.md.
+        Routes the scalar α to whichever attribute the active selector uses:
+          - `alpha`        — legacy BoltzmannActionSelector
+          - `entropy_coef` — current SoftPolicyActionSelector (used by
+                             α-annealing schedules)
         """
         if hasattr(self.action_selector, "alpha"):
             self.action_selector.alpha = alpha
+        elif hasattr(self.action_selector, "entropy_coef"):
+            self.action_selector.entropy_coef = alpha
 
     def init_hidden(self, batch_size):
         self.hidden_states = self.agent.init_hidden().unsqueeze(0).expand(

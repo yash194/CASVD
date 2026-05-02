@@ -69,6 +69,21 @@ standardise_rewards: False
 # safe — unlike QMIX where the nonlinear mixer amplified it ~30×.
 entropy_coef: 0.03
 
+# ── α annealing schedule ──────────────────────────────────────
+# After the policy's win rate saturates (~6–7M for GAT + Soft-QMIX),
+# the constant entropy bonus dominates the optimisation signal and
+# pulls the policy into stalling (longer episodes harvest more bonus).
+# Annealing α toward a small floor in the post-saturation window kills
+# this pressure and locks in the learned policy.
+#
+#   t < entropy_anneal_start         → α = entropy_coef            (full bonus)
+#   t in [start, end]                → linear decay to floor
+#   t ≥ entropy_anneal_end           → α = entropy_anneal_floor    (near-greedy)
+entropy_anneal_enabled: True
+entropy_anneal_start:   6000000
+entropy_anneal_end:     9000000
+entropy_anneal_floor:   0.005
+
 # ── Components 3 & 4 disabled for baseline test ──────────────
 lgdd_enabled: False
 use_adaptive_alpha: False

@@ -43,6 +43,26 @@ class CASVDLearner:
 
         self.entropy_coef = getattr(args, "entropy_coef", 0.03)
 
+        # ── α annealing schedule ──
+        # Diagnoses & fixes the late-training stalling regression: once the
+        # policy's win rate saturates, the constant entropy bonus dominates
+        # the optimisation signal and pulls the team into stalling.  We
+        # decay α from `entropy_coef` toward `entropy_anneal_floor` over the
+        # window [entropy_anneal_start, entropy_anneal_end].  Default off
+        # (matches vanilla Soft-QMIX behaviour).
+        self.entropy_anneal_enabled = getattr(args, "entropy_anneal_enabled", False)
+        self.entropy_anneal_start   = int(getattr(args, "entropy_anneal_start", 6_000_000))
+        self.entropy_anneal_end     = int(getattr(args, "entropy_anneal_end",   9_000_000))
+        self.entropy_anneal_floor   = float(getattr(args, "entropy_anneal_floor", 0.005))
+        assert self.entropy_anneal_end >= self.entropy_anneal_start >= 0, (
+            f"entropy_anneal_end ({self.entropy_anneal_end}) must be ≥ "
+            f"entropy_anneal_start ({self.entropy_anneal_start}) ≥ 0"
+        )
+        assert 0.0 <= self.entropy_anneal_floor <= self.entropy_coef, (
+            f"entropy_anneal_floor ({self.entropy_anneal_floor}) must be in "
+            f"[0, entropy_coef={self.entropy_coef}]"
+        )
+
         # ── Per-agent adaptive alpha (off by default) ──
         self.use_adaptive_alpha = getattr(args, "use_adaptive_alpha", False)
         self._coord_signals = None
@@ -89,6 +109,27 @@ class CASVDLearner:
         self.params = self.main_params
         self.last_target_update_episode = 0
         self.log_stats_t = -self.args.learner_log_interval - 1
+
+    def _current_alpha(self, t_env):
+        """Annealed entropy coefficient at training step t_env.
+
+        Schedule:
+          t < anneal_start            → α = entropy_coef     (full bonus)
+          t in [anneal_start, anneal_end] → linear decay to floor
+          t ≥ anneal_end              → α = anneal_floor     (near-greedy)
+
+        With annealing disabled, returns the original scalar entropy_coef
+        so behaviour is identical to vanilla Soft-QMIX.
+        """
+        if not self.entropy_anneal_enabled:
+            return self.entropy_coef
+        if t_env <= self.entropy_anneal_start:
+            return self.entropy_coef
+        if t_env >= self.entropy_anneal_end:
+            return self.entropy_anneal_floor
+        span = max(1, self.entropy_anneal_end - self.entropy_anneal_start)
+        frac = float(t_env - self.entropy_anneal_start) / float(span)
+        return self.entropy_coef + frac * (self.entropy_anneal_floor - self.entropy_coef)
 
     def _get_coord_signals(self, device):
         """Lazy-init per-agent coordination signal buffer.
@@ -148,10 +189,15 @@ class CASVDLearner:
             target_mac_out = th.stack(target_mac_out, dim=1)
             target_mac_out = self.target_mixer.func_g(target_mac_out, states, t_env)
 
+            # ── Annealed α used in BOTH sampling and target ──
+            # Computed once per train step so policy temperature, target
+            # entropy bonus, and rollout selector all stay consistent.
+            alpha_t = self._current_alpha(t_env)
+
             # Soft policy from online net (Double-Q: online selects)
             mac_out_detach = mac_out.clone().detach()
             mac_out_detach = self.mixer.func_f(mac_out_detach, states, t_env)
-            mac_out_detach = mac_out_detach / self.entropy_coef
+            mac_out_detach = mac_out_detach / alpha_t
             mac_out_detach[avail_actions == 0] = -9999999
             actions_pdf = th.softmax(mac_out_detach, dim=-1)
 
@@ -176,12 +222,12 @@ class CASVDLearner:
             # Mix sampled target Q through VDN sum
             target_qvals = self.target_mixer(target_qvals, states)
 
-            # TD(λ) with entropy bonus
+            # TD(λ) with entropy bonus — uses the same annealed α as sampling
             targets = build_td_lambda_targets(
                 rewards, terminated, mask,
                 target_qvals, self.n_agents,
                 self.args.gamma, self.args.td_lambda,
-                target_entropy=target_entropy * self.entropy_coef,
+                target_entropy=target_entropy * alpha_t,
             )
 
         # ═══════════════════════════════════════════════════════
@@ -232,6 +278,16 @@ class CASVDLearner:
         grad_norm = th.nn.utils.clip_grad_norm_(self.main_params, self.args.grad_norm_clip)
         self.main_optimizer.step()
 
+        # Push the current annealed α to the action selector so the next
+        # rollout batch samples actions with the same temperature used in
+        # this train step.  Required for the target/rollout consistency
+        # that Double-Q assumes.  Cheap — sets a single Python float.
+        if self.entropy_anneal_enabled:
+            if hasattr(self.mac, "set_alpha"):
+                self.mac.set_alpha(alpha_t)
+            elif hasattr(self.mac.action_selector, "entropy_coef"):
+                self.mac.action_selector.entropy_coef = alpha_t
+
         # ═══════════════════════════════════════════════════════
         # 8. Target network updates
         # ═══════════════════════════════════════════════════════
@@ -275,6 +331,9 @@ class CASVDLearner:
             )
             self.logger.log_stat("entropy", target_entropy.mean().item(), t_env)
             self.logger.log_stat("entropy_coef", self.entropy_coef, t_env)
+            # Annealed α actually used this step (= entropy_coef when annealing
+            # is off; decays toward `entropy_anneal_floor` when on).
+            self.logger.log_stat("alpha_t", alpha_t, t_env)
             self.logger.log_stat(
                 "err_mask", (mask_sum.sum() / mask_exp.sum()).item(), t_env
             )
