@@ -1,13 +1,21 @@
-# ─── SYNERGOS Phase 1 — Distributional Soft-QMIX with CVaR exploration ───
+# ─────────────────────────────────────────────────────────────────────
+# SYNERGOS — Synergy-Driven Equivariant Risk-Sensitive Soft-Q Learning
 #
-# Backbone: CASVD's GAT encoder + Soft-QMIX VDN-sum mixer.
-# Phase 1 swap: scalar Q-head → K-quantile QR head; soft-policy sampling
-#               uses CVaR_β over the K quantiles instead of mean Q.
+# Full algorithm: GAT encoder + sheaf-mixed distributional Soft-Q with
+# CVaR exploration + per-agent dual α + PID-synergy intrinsic reward +
+# future-conditioned slow-role InfoNCE + multi-timescale predictive sync.
 #
-# All Phase 2-5 components (sheaf mixer, synergy bonus, slow-role InfoNCE,
-# per-agent dual α, multi-timescale sync) are deferred — this file
-# deliberately stays minimal so any observed gain isolates the
-# distributional + CVaR contribution.
+# Each phase is independently toggleable below, so this file doubles as
+# the implementation of every ablation in the paper.  Defaults below are
+# the "full SYNERGOS" configuration (all toggles ON).
+# ─────────────────────────────────────────────────────────────────────
+
+# ── Phase toggles (paper table 8) ────────────────────────────
+use_sheaf:         True   # Phase 2: heterogeneous sheaf-cochain mixer
+use_dual_alpha:    True   # Phase 3: per-agent Lagrangian α (ADER-style)
+use_synergy_bonus: True   # Phase 4: PID-synergy intrinsic reward (NOVEL)
+use_slow_role:     True   # Phase 5a: future-conditioned slow-role InfoNCE
+use_sync_loss:     True   # Phase 5b: multi-timescale predictive sync
 
 # ── Action selection ─────────────────────────────────────────
 # Training: softmax( CVaR_β(Z(s, a; ·)) / α ) sampling.
@@ -34,17 +42,16 @@ obs_last_action: True
 obs_individual_obs: True
 
 # Controller and agent
-mac: "casvd_mac"               # reused; works with any agent that returns
-                               # a tensor whose first two dims are [B, N].
+mac: "casvd_mac"               # reused; works with the IQN agent too.
 agent: "iqn_gat_ns"
 agent_output_type: "q"
 learner: "synergos_learner"
 
-# ── Mixer (Soft-QMIX VDN + func_f + func_g) ──────────────────
-# DistSoftMixer is a thin wrapper over SoftMixer that lifts func_g and
-# func_f to operate per quantile.  Mixer hyperparams are unchanged.
-mixer: "qmix"                  # nominal name only — learner instantiates
-                               # DistSoftMixer directly.
+# ── Mixer ────────────────────────────────────────────────────
+# When use_sheaf=True the learner instantiates SheafSoftMixer (extends
+# DistSoftMixer); when False, the plain DistSoftMixer.  The "mixer: qmix"
+# key here is informational only.
+mixer: "qmix"
 mixing_embed_dim: 32
 hypernet_embed: 64
 
@@ -73,40 +80,91 @@ grad_norm_clip: 10
 standardise_returns: False
 standardise_rewards: False
 
-# ── Soft-QMIX entropy coefficient ───────────────────────────
-# Scalar α for Phase 1 (per-agent dual α is Phase 5).
-# 0.03 matches Soft-QMIX paper and the existing CASVD baseline.
+# ── Soft-QMIX entropy coefficient (Phase 1 / scalar-α fallback) ──
+# When use_dual_alpha=True this is the *initial* α (each per-agent log_α
+# is initialised to log(entropy_coef)).  When use_dual_alpha=False this
+# is the constant α used by both sampling and target entropy bonus.
 entropy_coef: 0.03
 
 # ── Distributional value head (QR-DQN style) ─────────────────
-# K = number of quantile fractions.  τ_k = (2k − 1) / (2K).  K = 8 is the
-# DFAC sweet spot — large enough to capture spawn-stochasticity tails, small
-# enough that the K_pred × K_target Huber pairwise grid stays tractable.
+# K = number of quantile fractions.  τ_k = (2k − 1) / (2K).
+# K = 8 is the DFAC sweet spot — large enough to capture spawn-stochasticity
+# tails, small enough that K_pred × K_target Huber pairs stay tractable.
 n_quantiles: 8
 huber_kappa: 1.0
 
 # ── CVaR risk-sensitive sampling ─────────────────────────────
-# π(a | s) ∝ exp( CVaR_β(Z(s, a; ·)) / α ).
-# Annealing β: 1.0 (mean, no risk aversion) → 0.25 (lower-quartile, hedge
-# against worst-case spawn).  Start the anneal at 0 so the very first
-# rollouts are mean-based (cheap, stable), and finish at 1 M env-steps
-# which is ~ 1/10 of a full 10 M run — leaves 90% of training under the
-# risk-sensitive regime to learn worst-case avoidance.
+# π(a | s) ∝ exp( CVaR_β(Z(s, a; ·)) / α ).  Anneal β from 1.0 (mean —
+# no risk aversion) → 0.25 (lower-quartile — hedge against worst-case
+# spawn) over the first 1 M env-steps, leaving 90 %+ of training under
+# the risk-sensitive regime.
 cvar_beta_start: 1.0
 cvar_beta_end:   0.25
 cvar_anneal_start: 0
 cvar_anneal_end:   1000000
 
-# ── Phase 2-5 components (DISABLED in Phase 1) ───────────────
-# Kept here for later phases to flip, so the YAML grows monotonically and
-# we can A/B individual components by toggle.
+# ── Phase 2: sheaf-cochain mixer ─────────────────────────────
+# Per-agent stalk identity dim (learned positional embedding).
+sheaf_id_dim: 16
+# Number of message-passing rounds.  K = 2 is enough for N ≤ 10 and
+# ~ 30× cheaper than literal heat kernel.
+n_sheaf_steps: 2
+# Convex update step size.  α = 0.5 = half-step, well-conditioned.
+sheaf_step_size: 0.5
+# Self-loop + softplus on restriction MLP keeps the mixer ≈ VDN at t=0
+# and adapts heterogeneity over training.
+sheaf_self_loop: True
+sheaf_restriction_hidden: 64
+
+# ── Phase 3: per-agent dual α (ADER-style) ───────────────────
+# Target entropy ratio: H̄_i = ratio * log|A|.  0.5 → "policy commits
+# halfway", a balanced explore/exploit floor.  Lagrangian descent on
+# log_α tunes per-agent α to keep H(π_i) close to H̄_i.
+target_entropy_ratio: 0.5
+alpha_lr: 0.0003
+alpha_min: 0.001
+alpha_max: 1.0
+
+# ── Phase 4: PID-synergy intrinsic reward ────────────────────
+# η · S̃_i added to per-step reward.  η = 0.001 is conservative — under
+# the safety bound  η · max S̃ < (1 − γ) · α · log|A|  ≈ 0.000537 (γ=0.99,
+# α=0.03, |A|=11), with synergy_clip = 0.5 the worst-case shaped reward
+# delta is 0.0005, well within bound.  Discriminator is a small InfoNCE
+# (~ 20 K params), gradient-isolated.
+synergy_eta: 0.001
+synergy_clip: 0.5
+synergy_n_negatives: 15
+synergy_hidden: 64
+synergy_temperature: 0.5
+synergy_lr: 0.0003
+
+# ── Phase 5a: future-conditioned slow-role InfoNCE ───────────
+# T_h = future-window horizon; predict h_{t+T_h} from h_t per agent.
+# Cross-batch + cross-agent negatives.  Auxiliary loss only — does not
+# yet condition the policy (representation-shaping role).
+slow_role_horizon: 8
+slow_role_dim: 32
+slow_role_temperature: 0.2
+slow_role_lr: 0.0003
+lambda_slow_role: 0.1
+
+# ── Phase 5b: multi-timescale predictive sync ────────────────
+# Each agent predicts every teammate's EMA-filtered latent at fast
+# (τ=0.95, ~ 20-step memory) and slow (τ=0.99, ~ 100-step memory) bands.
+sync_tau_fast: 0.95
+sync_tau_slow: 0.99
+lambda_sync: 0.01
+sync_lr: 0.0003
+
+# ── Legacy CASVD components (DISABLED in SYNERGOS) ───────────
+# CASVD's InfoNCE / coord-signal / Q-spread machinery is superseded by
+# Phase-4 synergy and Phase-5 slow-role.  Kept here off so the YAML
+# loader can still reach default fall-throughs.
 lgdd_enabled: False
 use_adaptive_alpha: False
 alpha_mode: "scalar"
 alpha_warmup_start: 0
 alpha_warmup_end:   0
-
-# Continual learning (off)
 cl_enabled: False
 
 store_agent_types: False
