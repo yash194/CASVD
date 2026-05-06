@@ -11,6 +11,7 @@ from .offpg_learner import OffPGLearner
 from .fmac_learner import FMACLearner
 from .sac_learner import SACLearner
 from .casvd_learner import CASVDLearner
+from .synergos_learner import SynergosLearner
 
 REGISTRY = {}
 
@@ -27,3 +28,4 @@ REGISTRY["offpg_learner"] = OffPGLearner
 REGISTRY["fmac_learner"] = FMACLearner
 REGISTRY["sac_learner"] = SACLearner
 REGISTRY["casvd_learner"] = CASVDLearner
+REGISTRY["synergos_learner"] = SynergosLearner

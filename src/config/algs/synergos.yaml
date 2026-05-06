@@ -1,0 +1,114 @@
+# ─── SYNERGOS Phase 1 — Distributional Soft-QMIX with CVaR exploration ───
+#
+# Backbone: CASVD's GAT encoder + Soft-QMIX VDN-sum mixer.
+# Phase 1 swap: scalar Q-head → K-quantile QR head; soft-policy sampling
+#               uses CVaR_β over the K quantiles instead of mean Q.
+#
+# All Phase 2-5 components (sheaf mixer, synergy bonus, slow-role InfoNCE,
+# per-agent dual α, multi-timescale sync) are deferred — this file
+# deliberately stays minimal so any observed gain isolates the
+# distributional + CVaR contribution.
+
+# ── Action selection ─────────────────────────────────────────
+# Training: softmax( CVaR_β(Z(s, a; ·)) / α ) sampling.
+# Test:     greedy argmax on E_τ[Z] (mean Q, raw — no func_g/func_f).
+action_selector: "iqn_cvar_soft_policy"
+epsilon_start: 1.0
+epsilon_finish: 0.05
+epsilon_anneal_time: 100000
+
+# Runner
+runner: "parallel"
+batch_size_run: 8
+
+# Replay buffer
+buffer_size: 5000
+batch_size: 128
+
+# Target updates (hard copy every 200 episodes — matches CASVD)
+target_update_interval_or_tau: 200
+
+# Observations
+obs_agent_id: True
+obs_last_action: True
+obs_individual_obs: True
+
+# Controller and agent
+mac: "casvd_mac"               # reused; works with any agent that returns
+                               # a tensor whose first two dims are [B, N].
+agent: "iqn_gat_ns"
+agent_output_type: "q"
+learner: "synergos_learner"
+
+# ── Mixer (Soft-QMIX VDN + func_f + func_g) ──────────────────
+# DistSoftMixer is a thin wrapper over SoftMixer that lifts func_g and
+# func_f to operate per quantile.  Mixer hyperparams are unchanged.
+mixer: "qmix"                  # nominal name only — learner instantiates
+                               # DistSoftMixer directly.
+mixing_embed_dim: 32
+hypernet_embed: 64
+
+# Optimizer
+lr: 0.001
+optimizer: "adam"
+optimizer_epsilon: 0.0000001
+
+# GAT encoder (verbatim from CASVD)
+hidden_dim: 128
+n_heads: 4
+use_rnn: True
+use_layer_norm: True
+use_orthogonal: True
+encoder_gain: 1.0
+q_head_gain: 0.1
+
+# TD learning
+gamma: 0.99
+td_lambda: 0.4
+
+# Gradient clipping
+grad_norm_clip: 10
+
+# Reward
+standardise_returns: False
+standardise_rewards: False
+
+# ── Soft-QMIX entropy coefficient ───────────────────────────
+# Scalar α for Phase 1 (per-agent dual α is Phase 5).
+# 0.03 matches Soft-QMIX paper and the existing CASVD baseline.
+entropy_coef: 0.03
+
+# ── Distributional value head (QR-DQN style) ─────────────────
+# K = number of quantile fractions.  τ_k = (2k − 1) / (2K).  K = 8 is the
+# DFAC sweet spot — large enough to capture spawn-stochasticity tails, small
+# enough that the K_pred × K_target Huber pairwise grid stays tractable.
+n_quantiles: 8
+huber_kappa: 1.0
+
+# ── CVaR risk-sensitive sampling ─────────────────────────────
+# π(a | s) ∝ exp( CVaR_β(Z(s, a; ·)) / α ).
+# Annealing β: 1.0 (mean, no risk aversion) → 0.25 (lower-quartile, hedge
+# against worst-case spawn).  Start the anneal at 0 so the very first
+# rollouts are mean-based (cheap, stable), and finish at 1 M env-steps
+# which is ~ 1/10 of a full 10 M run — leaves 90% of training under the
+# risk-sensitive regime to learn worst-case avoidance.
+cvar_beta_start: 1.0
+cvar_beta_end:   0.25
+cvar_anneal_start: 0
+cvar_anneal_end:   1000000
+
+# ── Phase 2-5 components (DISABLED in Phase 1) ───────────────
+# Kept here for later phases to flip, so the YAML grows monotonically and
+# we can A/B individual components by toggle.
+lgdd_enabled: False
+use_adaptive_alpha: False
+alpha_mode: "scalar"
+alpha_warmup_start: 0
+alpha_warmup_end:   0
+
+# Continual learning (off)
+cl_enabled: False
+
+store_agent_types: False
+
+name: "synergos"

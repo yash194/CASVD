@@ -10,6 +10,7 @@ from .mlp_agent import MLPAgent
 from .atten_rnn_agent import ATTRNNAgent
 from .noisy_agents import NoisyRNNAgent
 from .gat_ns_agent import GATNSAgent
+from .iqn_gat_ns_agent import IQNGATNSAgent
 
 REGISTRY["rnn"] = RNNAgent
 REGISTRY["n_rnn"] = NRNNAgent
@@ -21,3 +22,4 @@ REGISTRY["mlp"] = MLPAgent
 REGISTRY["att_rnn"] = ATTRNNAgent
 REGISTRY["noisy_rnn"] = NoisyRNNAgent
 REGISTRY["gat_ns"] = GATNSAgent
+REGISTRY["iqn_gat_ns"] = IQNGATNSAgent

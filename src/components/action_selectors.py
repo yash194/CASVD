@@ -239,6 +239,110 @@ class SoftPolicyActionSelector():
 REGISTRY["soft_policy"] = SoftPolicyActionSelector
 
 
+class IQNCVaRSoftPolicySelector():
+    """Soft-policy action selection over a quantile-distributional Q.
+
+    During training: each action's risk-sensitive value is
+
+        V_β(s, a)  =  CVaR_β(  Z(s, a ; ·)  )
+                  ≈  mean of the bottom ⌊β·K⌋ quantiles of  Z(s, a ; τ).
+
+    Then π_i(a | s) ∝ exp( V_β(s, a) / α_i ).  For β=1.0 this collapses to
+    the mean Q-value (= scalar Soft-QMIX).  Annealing β from 1.0 → β_target
+    fades risk-sensitivity in over training so early exploration is mean-
+    based and stable.
+
+    During test: greedy argmax on the mean of the *raw* (no-mixer) quantile
+    distribution — same convention as SoftPolicyActionSelector.
+
+    α supports per-agent tensor or scalar form, set externally via the MAC's
+    `set_alpha` hook (writes to `self.alpha_vec`).  When `alpha_vec` is None
+    the scalar fallback `entropy_coef` is used.
+    """
+
+    def __init__(self, args):
+        self.args = args
+        self.entropy_coef = getattr(args, "entropy_coef", 0.03)
+        self.K = int(getattr(args, "n_quantiles", 8))
+
+        # CVaR β annealing.  At t_env ≤ start → β = β_start (1.0, mean);
+        # at t_env ≥ end → β = β_end (e.g. 0.25, lower-quartile risk).
+        self.cvar_beta_start = float(getattr(args, "cvar_beta_start", 1.0))
+        self.cvar_beta_end   = float(getattr(args, "cvar_beta_end",   0.25))
+        self.cvar_anneal_start = int(getattr(args, "cvar_anneal_start", 0))
+        self.cvar_anneal_end   = int(getattr(args, "cvar_anneal_end",   1_000_000))
+
+        # Per-agent α vector, set by the learner via CASVDMAC.set_alpha.
+        self.alpha_vec = None
+
+    def _current_cvar_beta(self, t_env):
+        if t_env <= self.cvar_anneal_start:
+            return self.cvar_beta_start
+        if t_env >= self.cvar_anneal_end:
+            return self.cvar_beta_end
+        span = max(1, self.cvar_anneal_end - self.cvar_anneal_start)
+        frac = float(t_env - self.cvar_anneal_start) / float(span)
+        return self.cvar_beta_start + frac * (self.cvar_beta_end - self.cvar_beta_start)
+
+    @staticmethod
+    def cvar_value(z, beta):
+        """CVaR_β over the last (quantile) dim.  z: [..., K] → [...]."""
+        K = z.shape[-1]
+        m = max(1, int(round(float(beta) * K)))
+        z_sorted, _ = th.sort(z, dim=-1)
+        return z_sorted[..., :m].mean(dim=-1)
+
+    def select_action(self, agent_inputs, avail_actions, t_env, test_mode=False,
+                       mixer=None, states=None):
+        """agent_inputs: Z [B, n_agents, n_actions, K] (raw, pre-mixer).
+        avail_actions: [B, n_agents, n_actions].
+        Returns picked_actions: [B, n_agents] long.
+        """
+        Z = agent_inputs
+
+        if test_mode:
+            # Greedy on the mean of the raw distribution (no mixer transformations).
+            mean_q = Z.mean(dim=-1)  # [B, N, A]
+            mean_q = mean_q.masked_fill(avail_actions == 0, float("-inf"))
+            return mean_q.max(dim=-1)[1]
+
+        # Apply Soft-QMIX mixer transformations (func_g + func_f) per quantile.
+        # The DistSoftMixer methods expect a leading T dim; rollout has T=1.
+        if mixer is not None and states is not None and hasattr(mixer, "func_g_dist"):
+            Z5 = Z.unsqueeze(1)               # [B, 1, N, A, K]
+            states3 = states.unsqueeze(1)     # [B, 1, S]
+            Z5 = mixer.func_g_dist(Z5, states3, t_env).detach()
+            Z5 = mixer.func_f_dist(Z5, states3, t_env).detach()
+            Z = Z5.squeeze(1)                 # [B, N, A, K]
+
+        # Risk-sensitive value: CVaR_β over the K quantiles.
+        beta = self._current_cvar_beta(t_env)
+        v_beta = self.cvar_value(Z, beta)     # [B, N, A]
+
+        # Per-agent or scalar α.
+        if self.alpha_vec is not None:
+            alpha = self.alpha_vec
+            if hasattr(alpha, "to"):
+                alpha = alpha.to(v_beta.device)
+                divisor = alpha.view(1, -1, 1)
+            else:
+                divisor = float(alpha)
+            logits = v_beta / divisor
+        else:
+            logits = v_beta / float(self.entropy_coef)
+        logits = logits.masked_fill(avail_actions == 0, float("-inf"))
+        probs = th.softmax(logits, dim=-1)
+
+        cdf = th.cumsum(probs, dim=-1)
+        rand_idx = th.rand(probs[..., :1].shape, device=probs.device)
+        rand_idx = th.clamp(rand_idx, 1e-6, 1 - 1e-6)
+        picked = th.searchsorted(cdf, rand_idx)
+        return picked.squeeze(-1)
+
+
+REGISTRY["iqn_cvar_soft_policy"] = IQNCVaRSoftPolicySelector
+
+
 class GaussianActionSelector():
 
     def __init__(self, args):
